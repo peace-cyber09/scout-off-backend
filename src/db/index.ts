@@ -114,8 +114,14 @@ export async function initDb(): Promise<void> {
     logger.info(`[db] Connected to SQLite at ${config.dbPath}`);
   }
 
-  // Run migrations (SQL migration files from db/ directory)
-  runMigrations(_driver);
+  // Run migrations unless disabled via RUN_MIGRATIONS_ON_BOOT
+  if (config.runMigrationsOnBoot) {
+    logger.info('[db] Running migrations on startup');
+    runMigrations(_driver);
+    logger.info('[db] Migrations completed');
+  } else {
+    logger.info('[db] Skipping migrations on startup (RUN_MIGRATIONS_ON_BOOT=false)');
+  }
 
   // Seed a subscription row for the legacy WEBHOOK_URL/WEBHOOK_ENABLED config on
   // first startup, so single-subscriber deployments keep working with the new

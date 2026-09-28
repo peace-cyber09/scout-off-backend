@@ -8,3 +8,6 @@ coverage/
 BUILD_COMMIT
 .husky/_
 
+
+# PR description files (local working notes, not for review)
+pr-*.md

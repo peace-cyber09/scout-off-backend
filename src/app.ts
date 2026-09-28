@@ -18,11 +18,14 @@ import { stellarHealth, stellarBreaker } from './services/stellar';
 import { checkHealth } from './services/ipfs';
 import { API_PREFIX, API_V1_PREFIX } from './config';
 import { mountGraphQL } from './graphql';
+import { createPersistedOperationsPlugin } from './graphql/persisted-operations';
+import { loadPersistedOperationsFromFile } from './graphql/persisted-operations';
 import { metricsMiddleware, createMetricsHandler } from './middleware/metrics';
 import { ipReputationMiddleware } from './middleware/ipReputation';
 import { requestTimeout } from './middleware/timeout';
 import { indexerLedgerLag } from './services/indexer';
-import { getDb } from './db';
+import { getDb, closeDb } from './db';
+import { getAppliedMigrations, getExpectedSchemaVersion } from './db/migrate';
 import { getVersionInfo } from './version';
 import { apiVersion } from './middleware/apiVersion';
 import docsRouter from './routes/docs';
@@ -125,7 +128,31 @@ app.get('/health', async (_req, res) => {
 async function checkReadiness(): Promise<Record<string, 'ok' | 'unavailable' | 'disabled'>> {
   const services: Record<string, 'ok' | 'unavailable' | 'disabled'> = {};
 
-  services.db = (await probeDbWritable()) === 'ok' ? 'ok' : 'unavailable';
+  // Check database connectivity and writability first
+  const dbWritable = await probeDbWritable();
+  if (dbWritable !== 'ok') {
+    services.db = 'unavailable';
+    return services;
+  }
+
+  // Check schema version if migrations are enabled on boot
+  if (!config.runMigrationsOnBoot) {
+    try {
+      const applied = getAppliedMigrations();
+      const expected = getExpectedSchemaVersion();
+      
+      if (applied.length < expected.migrations.length) {
+        services.db = 'unavailable';
+        services.schemaVersion = 'behind';
+        return services;
+      }
+    } catch (err) {
+      // If we can't check schema version (e.g., migrations table not created),
+      // treat as unavailable to prevent serving with wrong schema
+      services.db = 'unavailable';
+      return services;
+    }
+  }
 
   try {
     await checkHealth();
@@ -194,6 +221,10 @@ for (const prefix of prefixes) {
   app.use(`${prefix}/admin`, adminRoutes);
 }
 
+// Load persisted operations (production mode only)
+const persistedOpsFile = process.env.GRAPHQL_PERSISTED_OPS_FILE ?? 'dist/graphql/persisted-operations.json';
+loadPersistedOperationsFromFile(persistedOpsFile);
+
 // Mount the GraphQL endpoint alongside the REST API.
 // Must be registered before the 404 catch-all.
 mountGraphQL(app);
@@ -208,3 +239,6 @@ app.use((req, res) => {
 app.use(errorHandler);
 
 export default app;
+
+
+

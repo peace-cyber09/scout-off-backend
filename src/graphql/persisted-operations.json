@@ -1,0 +1,8 @@
+{
+  "//": "Persisted Operations Registry",
+  "//": "This file is auto-generated. DO NOT edit manually.",
+  "//": "To add operations, update the frontend build process or use the admin endpoint.",
+  "//": "Hashes are SHA-256 of the GraphQL document string.",
+  "//": "Format: { \"operationHash\": \"query/mutation document\", ... }",
+  "placeholder": ""
+}

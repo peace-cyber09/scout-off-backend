@@ -220,6 +220,49 @@ const config = {
 
   /** TTL for multi-admin action proposals in milliseconds (default: 1 hour). */
   adminActionTtlMs: parseInt(process.env.ADMIN_ACTION_TTL_MS ?? '3600000', 10),
+  
+  /**
+   * Persisted operations mode.
+   * 
+   * In production (GRAPHQL_PERSISTED_ONLY=true): Only pre-registered operation hashes are accepted.
+   * In development: Arbitrary queries are allowed for interactive testing.
+   * 
+   * Default: true in production, false otherwise.
+   */
+  graphqlPersistedOnly: (() => {
+    const raw = process.env.GRAPHQL_PERSISTED_ONLY;
+    if (raw !== undefined && raw !== '') {
+      if (raw === 'true' || raw === '1' || raw === 'yes') return true;
+      if (raw === 'false' || raw === '0' || raw === 'no') return false;
+      throw new Error(
+        `GRAPHQL_PERSISTED_ONLY="${raw}" is invalid. Must be one of: true/false, 1/0, yes/no.`
+      );
+    }
+    // Default to true in production, false in dev/staging/test
+    return config.nodeEnv === 'production';
+  })(),
+  
+  /**
+   * Run migrations on application startup.
+   * 
+   * For SQLite or single-replica deployments: default true (auto-migrate on boot).
+   * For PostgreSQL with multiple replicas: recommended false (use Helm hook Job instead).
+   * 
+   * Set to "false" to disable boot-time migrations.
+   */
+  runMigrationsOnBoot: (() => {
+    const raw = process.env.RUN_MIGRATIONS_ON_BOOT;
+    if (raw === undefined || raw === '' || raw === 'true' || raw === '1' || raw === 'yes') {
+      // Default to true for SQLite, false for Postgres with multiple replicas
+      return config.dbDriver === 'sqlite';
+    }
+    if (raw === 'false' || raw === '0' || raw === 'no') {
+      return false;
+    }
+    throw new Error(
+      `RUN_MIGRATIONS_ON_BOOT="${raw}" is invalid. Must be one of: true/false, 1/0, yes/no.`
+    );
+  })(),
 
 };
 
@@ -232,3 +275,7 @@ export function isDevelopment(): boolean { return config.nodeEnv === 'developmen
 /** Route prefix constants for API versioning */
 export const API_PREFIX = process.env.API_PREFIX ?? '/api';
 export const API_V1_PREFIX = process.env.API_V1_PREFIX ?? '/api/v1';
+
+
+
+

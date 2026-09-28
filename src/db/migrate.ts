@@ -5,8 +5,8 @@ import config from '../config';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../db');
 
-export function runMigrations(driver: DbDriver): void {
-  // Create migrations table
+export function getAppliedMigrations(driver: DbDriver): string[] {
+  // Ensure migrations table exists first
   const createMigrationsTableSql =
     config.dbDriver === 'postgres'
       ? 'CREATE TABLE IF NOT EXISTS migrations (id TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)'
@@ -14,18 +14,31 @@ export function runMigrations(driver: DbDriver): void {
 
   driver.exec(createMigrationsTableSql);
 
+  const rows = driver.all<{ id: string }>(
+    'SELECT id FROM migrations ORDER BY id'
+  );
+  
+  return rows.map(row => row.id);
+}
+
+export function getExpectedSchemaVersion(): { migrations: string[] } {
+  const files = fs
+    .readdirSync(MIGRATIONS_DIR)
+    .filter((f) => f.endsWith('.sql') && !f.includes('_postgres'))
+    .sort();
+
+  return { migrations: files };
+}
+
+export function runMigrations(driver: DbDriver): void {
+  const applied = getAppliedMigrations(driver);
   const files = fs
     .readdirSync(MIGRATIONS_DIR)
     .filter((f) => f.endsWith('.sql') && !f.includes('_postgres'))
     .sort();
 
   for (const file of files) {
-    const already = driver.get<{ id: string }>(
-      'SELECT id FROM migrations WHERE id = ?',
-      [file]
-    );
-
-    if (already) continue;
+    if (applied.includes(file)) continue;
 
     let sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
 

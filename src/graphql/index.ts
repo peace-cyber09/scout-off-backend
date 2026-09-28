@@ -21,6 +21,8 @@ import { typeDefs } from './schema';
 import { resolvers } from './resolvers';
 import { createContext } from './context';
 import { logger } from '../utils/logger';
+import { createPersistedOperationsPlugin } from './persisted-operations';
+import config from '../config';
 
 const MAX_DEPTH = 5;
 
@@ -143,17 +145,21 @@ function createBlockIntrospectionPlugin() {
 export function mountGraphQL(app: Application): void {
   const isProduction = process.env.NODE_ENV === 'production';
 
+  // Persisted operations plugin is always enabled (controls both dev and prod modes)
+  const plugins = [
+    useValidationRule(createDepthLimitRule(MAX_DEPTH)),
+    createPersistedOperationsPlugin(),
+    ...(isProduction ? [createBlockIntrospectionPlugin()] : []),
+  ];
+  
   const yoga = createYoga({
     schema: createSchema({
       typeDefs,
       resolvers,
     }),
     context: createContext,
-    // Depth limiting via @envelop/core useValidationRule; introspection blocking via onExecute plugin
-    plugins: [
-      useValidationRule(createDepthLimitRule(MAX_DEPTH)),
-      ...(isProduction ? [createBlockIntrospectionPlugin()] : []),
-    ],
+    // Depth limiting and persisted operations via plugins; introspection blocking for production
+    plugins,
     // graphql-yoga manages its own /graphql path
     graphqlEndpoint: '/graphql',
     // Log errors (graphql-yoga catches them internally)
