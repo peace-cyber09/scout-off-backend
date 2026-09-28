@@ -17,13 +17,18 @@
  * This is a format-only check — no network requests are made.
  */
 
-/** Returns true when `uri` is a non-empty string with an ipfs:// or https:// scheme and meaningful content after it. */
-export function isValidEvidenceUri(uri: string): boolean {
-  if (!uri || typeof uri !== 'string') return false;
+// CIDv0: Base58-encoded SHA2-256 multihash.
+// Always "Qm" prefix + 44 base58btc characters = 46 total.
+const CID_V0_RE = /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/;
+
+// CIDv1: base32 lower-case (the default encoding used by modern IPFS tooling).
+// The two common prefixes in the wild are "bafy" (dag-pb / raw) and "bafk" (sha2-512).
+// At least 50 chars total to rule out accidental short matches.
+const CID_V1_RE = /^(bafy|bafk)[2-7a-z]{46,}$/;
 
 // HTTPS URL — requires a proper hostname (no raw IPs, no localhost).
 // Rejects path traversal ("..") anywhere in the URL string.
-const HTTPS_HOSTNAME_RE = /^https:\/\/[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)+/;
+const HTTPS_HOSTNAME_RE = /^https:\/\/[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+/;
 
 /** Standard error message returned by Zod refinements and HTTP 400 responses. */
 export const URI_VALIDATION_ERROR =
@@ -77,4 +82,24 @@ export function isValidMetadataUri(uri: string): boolean {
  */
 export function isValidEvidenceUri(uri: string): boolean {
   return isValidMetadataUri(uri);
+}
+
+/**
+ * Validator for fields that (unlike metadata_uri/evidence_uri) still accept
+ * the ipfs:// scheme by convention — e.g. a scout's free-form trial-offer
+ * detailsUri. Accepts `ipfs://` or `https://` URIs with meaningful content
+ * after the scheme; does not require the ipfs:// content to be a well-formed
+ * CID (this predates the stricter bare-CID policy introduced for
+ * metadata_uri/evidence_uri — see isValidMetadataUri above).
+ */
+const IPFS_OR_HTTPS_SCHEMES = ['ipfs://', 'https://'];
+const IPFS_OR_HTTPS_MIN_CONTENT_LENGTH = 3;
+
+export function isValidIpfsOrHttpsUri(uri: string): boolean {
+  if (!uri || typeof uri !== 'string') return false;
+
+  const scheme = IPFS_OR_HTTPS_SCHEMES.find((s) => uri.startsWith(s));
+  if (!scheme) return false;
+
+  return uri.slice(scheme.length).trim().length >= IPFS_OR_HTTPS_MIN_CONTENT_LENGTH;
 }

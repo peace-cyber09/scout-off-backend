@@ -10,12 +10,99 @@ Scout-Off supports two database drivers:
 
 The migration is reversible within a maintenance window.
 
+> **Schema migrations vs. this guide:** this document covers moving an existing
+> deployment's *data* from SQLite to PostgreSQL. For how the `db/` directory's
+> SQL *schema* migrations are named, paired across dialects, and ordered, see
+> [db/README.md](../db/README.md).
+
+> **Helm chart default:** the `helm/scout-off-backend` chart ships with a
+> single-replica, SQLite-backed default topology (`replicaCount: 1`, HPA and
+> PDB disabled). Horizontal scaling (multiple replicas or the HPA) requires
+> PostgreSQL — switch `env.DB_DRIVER` to `postgres` and provide
+> `env.DATABASE_URL` **before** scaling. The chart loudly warns in its
+> NOTES.txt output if you scale while still on SQLite. See DEPLOYMENT.md.
+
 ## Prerequisites
 
 - PostgreSQL 12 or later
 - `pg_dump` utility (included with PostgreSQL)
 - Network connectivity between backend instances and PostgreSQL server
 - Admin access to create databases and users
+
+## Database Configuration
+
+Before starting the backend, configure these environment variables:
+
+| Variable | Accepted Values | Default | Purpose |
+|---|---|---|---|
+| `DB_DRIVER` | `sqlite` or `postgres` | `sqlite` | Which database system to use; typos cause startup failure (no silent fallback) |
+| `DATABASE_URL` | PostgreSQL connection string | (none) | **Required when `DB_DRIVER=postgres`**. Format: `postgresql://user:password@host:5432/dbname` |
+| `DATABASE_SSL` | `true`, `no-verify`, `false` | (disabled) | TLS/SSL mode for PostgreSQL connections. See [SSL / TLS Configuration](#ssl--tls-configuration) |
+| `DATABASE_POOL_SIZE` | Integer 1–100 | `10` | Maximum concurrent connections in the pool. Only used with `DB_DRIVER=postgres` |
+
+### `DB_DRIVER` behavior
+
+The backend **requires an explicit, valid `DB_DRIVER` value**:
+
+- `DB_DRIVER=sqlite` — Use SQLite (local file-based, single-writer)
+- `DB_DRIVER=postgres` — Use PostgreSQL (requires `DATABASE_URL`)
+- Any other value (typo, misspelling) → **server fails at startup** with an error message
+
+```
+ERROR: DB_DRIVER="postgrez" is invalid. Must be one of: sqlite, postgres. 
+       Check for typos — an unrecognised value does NOT fall back to SQLite; 
+       the server will not start.
+```
+
+This is intentional: an undetected typo could silently cause a production deployment to use SQLite instead of the intended PostgreSQL, leading to lost data in a multi-replica scenario.
+
+### `DATABASE_URL` format
+
+When `DB_DRIVER=postgres`, provide a valid PostgreSQL URI:
+
+```
+postgresql://user:password@host:5432/dbname
+```
+
+Breaking this down:
+- `user` — Database user (e.g., `scout_user`)
+- `password` — User password (keep secure; use secrets management)
+- `host` — PostgreSQL server hostname or IP
+- `5432` — PostgreSQL port (default; adjust if your server runs on a different port)
+- `dbname` — Database name (e.g., `scout_off`)
+
+**Examples:**
+
+Local development (Docker Compose):
+```
+DATABASE_URL=postgresql://scout_user:password@postgres:5432/scout_off
+```
+
+AWS RDS:
+```
+DATABASE_URL=postgresql://scout_user:password@scout-off-db.abc123.us-east-1.rds.amazonaws.com:5432/scout_off
+```
+
+Heroku Postgres:
+```
+# Heroku sets DATABASE_URL automatically; it looks like:
+# postgresql://user:password@ec2-1-2-3-4.compute-1.amazonaws.com:5432/database
+```
+
+Supabase:
+```
+DATABASE_URL=postgresql://postgres:password@db.project-ref.supabase.co:5432/postgres
+```
+
+### `DATABASE_POOL_SIZE` guidance
+
+| Deployment | Recommended | Notes |
+|---|---|---|
+| Development (single instance) | 5–10 | Conservative; local testing doesn't stress the pool |
+| Staging (1–3 replicas) | 10–20 | Moderate load; balance pool size against PgBouncer if used |
+| Production (3+ replicas with HPA) | 20–50 | Higher concurrency; monitor pool exhaustion via application metrics |
+
+Each replica maintains its own pool, so a 3-replica deployment with `DATABASE_POOL_SIZE=20` opens up to 60 total connections to PostgreSQL. Ensure the PostgreSQL `max_connections` setting is at least `(replicas × pool_size) + 10` to account for admin and utility connections.
 
 ## Pre-Migration Checklist
 
@@ -147,17 +234,84 @@ env:
 
 ## Step 6: Enable Horizontal Scaling
 
-With PostgreSQL, multiple backend replicas can now safely share the same database:
+With PostgreSQL, multiple backend replicas can safely share the same database.
+This section describes exactly what "safely" means here (#1014) — concretely,
+not as a general promise.
+
+> **Helm chart:** scaling is a two-step change — first set `env.DB_DRIVER: postgres`
+> and provide `env.DATABASE_URL` (plus `DATABASE_SSL` for managed providers), then
+> raise `replicaCount` and/or enable `hpa.enabled`. Doing it in the opposite order
+> (scaling while still on SQLite) is exactly the broken combination the chart's
+> default topology guards against:
 
 ```yaml
 # Example: 3 backend replicas
 replicas: 3
 ```
 
-All instances will:
-- Connect to the same PostgreSQL database
-- Use row-level locking and transactions for consistency
-- Benefit from connection pooling via PgBouncer or pgpool2 (optional)
+### What every instance actually does
+
+- **Connects to the same PostgreSQL database** through its own connection
+  pool (`pg.Pool`, default size 10, configurable via `DATABASE_POOL_SIZE`
+  (1-100) — see `PostgresDriver`'s constructor in
+  `src/db/postgres-driver.ts`). Every query is genuinely `await`-ed against
+  that pool; there is no busy-waiting or blocking of the Node event loop, so
+  concurrent requests within and across replicas are served in parallel
+  (bounded by pool size), not serialized.
+- **Every application code path goes through the same `DbDriver` abstraction**
+  on both SQLite and PostgreSQL (`src/db/driver.ts`) — the raw
+  `better-sqlite3` handle (`getDb()`) is no longer reachable from application
+  code outside the driver implementations themselves, so behavior (return
+  shapes, error semantics, transactional guarantees) is the same regardless
+  of which driver a given deployment runs.
+- **Multi-statement writes run inside a real transaction**
+  (`driver.transaction(fn)`), which on PostgreSQL is a genuine
+  `BEGIN`/`COMMIT`/`ROLLBACK` on one dedicated pooled connection per call —
+  not row-level locking in the general sense, and not automatic protection
+  against every possible race. A transaction only prevents another
+  transaction from observing its uncommitted writes; it does **not** by
+  itself stop two concurrent transactions from both reading the same "last
+  row" under PostgreSQL's default READ COMMITTED isolation and then both
+  writing based on that stale read.
+- **The one place in this codebase where that specific race matters — the
+  audit-log hash chain's "read the previous hash, then insert" sequence
+  (`insertAuditLog` in `src/db/index.ts`) — is closed explicitly**, via
+  `tx.lockForWrite('audit_log')` (`DbTxHandle.lockForWrite`,
+  `src/db/driver.ts`). On PostgreSQL this takes a transaction-scoped
+  advisory lock (`pg_advisory_xact_lock`) before the read, so concurrent
+  `insertAuditLog` calls across every replica linearize instead of racing;
+  on SQLite it's a no-op because `SqliteDriver` already serializes all
+  transactions on its single connection. This is what makes the hash chain
+  provably unbroken under concurrent load — verified by a live-Postgres test
+  that fires 120 simultaneous inserts and checks the resulting chain has no
+  gaps (`tests/db/postgresIntegration.test.ts`).
+- **`audit_log.hash` and `audit_log.event_source` are `NOT NULL` on both
+  drivers** (`db/012_audit_log_hash_chain_postgres.sql`,
+  `db/014_audit_log_hash_not_null_postgres.sql`) — a previous version of the
+  PostgreSQL schema allowed `NULL` in both columns, silently weakening the
+  tamper-evidence guarantee the hash chain exists to provide. A write that
+  fails now throws (`insertAuditLog` propagates the error;
+  `logAuditEvent` logs it at `critical` severity and rethrows) rather than
+  being silently dropped.
+- **SQLite's single-writer connection uses WAL mode and a 5-second
+  `busy_timeout`** (`src/db/index.ts`) so readers and a writer can proceed
+  concurrently instead of blocking on the default rollback journal, and a
+  write under transient lock contention waits and retries at the SQLite
+  engine level instead of failing immediately with `SQLITE_BUSY`.
+- **No general row-level locking is applied outside the audit-log path
+  described above.** Other multi-statement writes in this codebase (player
+  upserts, feature-flag toggles, saved-search CRUD, etc.) are each scoped to
+  a single logical resource keyed by its own primary key, so ordinary
+  PostgreSQL MVCC/row-versioning semantics under READ COMMITTED are
+  sufficient — there is no other "read stale value across two connections,
+  then write" sequence in the current codebase. If you add one, it needs the
+  same `lockForWrite`-style treatment; a transaction alone does not
+  guarantee it's race-free.
+- **Connection pooling via PgBouncer or pgpool2 remains optional** — see
+  [PostgreSQL Connection Pooling](#postgresql-connection-pooling-optional)
+  below. `pg.Pool`'s own per-process pooling is sufficient for most
+  deployment sizes; an external pooler helps once you're running many
+  replicas against a database with a limited `max_connections`.
 
 ## Rollback Procedure
 
@@ -374,6 +528,40 @@ A: Use tools like:
 - `pg_stat_statements` (query performance)
 - `pgAdmin` (web UI)
 - `Prometheus + postgres_exporter` (metrics)
+
+**Q: How is the PostgreSQL driver actually tested — is it just mocked?**
+
+A: No. `.github/workflows/ci.yml`'s `postgres` job runs the application test
+suite against a real `postgres:16-alpine` service container on every push
+and pull request. You can run the same thing locally with
+`npm run test:postgres` against a Postgres instance reachable at
+`DATABASE_URL` (`docker-compose up -d postgres` starts one). Separately,
+`tests/db/postgresIntegration.test.ts` runs against a live instance too
+(set `POSTGRES_TEST_URL` or `DATABASE_URL`) and specifically proves: 60+
+concurrent queries complete in pool-bounded parallel time (not serialized),
+a slow in-flight query never blocks the Node event loop, `NULL` inserts
+into `audit_log.hash`/`event_source` are rejected, and 120 simultaneous
+audit-log writes produce zero silent loss with an unbroken hash chain.
+
+A small set of suites is still excluded from the Postgres CI job /
+`test:postgres` because they exercise SQLite-specific or sync-`getDb()`
+paths. `tests/routes/adminPagination.test.ts` was re-enabled (fully
+mocked — passes under `DB_DRIVER=postgres`). Remaining exclusions and the
+follow-ups needed for each (file a tracking issue per exclusion if one
+does not already exist; related work under #1014 / #1018):
+
+| Suite | Why excluded / follow-up |
+| --- | --- |
+| `tests/services/indexer.test.ts`, `indexerDispatch.test.ts`, `tierPromotion.test.ts`, `tests/routes/reindex.test.ts`, `tests/db/backfill.test.ts` | Raw `getDb()` / SQLite SQL in indexer/reindex/tier/backfill paths |
+| `tests/services/webhooks.test.ts`, `tests/controllers/webhookAdminController.test.ts` | Sync `getDb()` in webhook delivery / admin |
+| `tests/routes/adminExport.test.ts`, `exportStreaming.test.ts`, `adminQuerySchema.test.ts` | `better-sqlite3` `.iterate()` / export streaming assumptions |
+| `tests/e2e/milestonePromotion.e2e.test.ts`, `scoutUnlock.e2e.test.ts` | E2E suites still SQLite-oriented |
+| `tests/db/sqlInjectionRegression.test.ts` | Driver-specific SQL regression harness |
+| `tests/routes/playerListFreshness.test.ts`, `trialOffers.test.ts` | Suites that call sync `getDb()` directly |
+| `tests/routes/adminAuditTrail.test.ts` | Audit-trail path still tied to SQLite assumptions |
+
+Keep CI and `package.json` `test:postgres` ignore lists in sync when
+re-enabling a suite.
 
 ## Support
 

@@ -18,7 +18,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { trace, isSpanContextValid, SpanContext } from '@opentelemetry/api';
 import axios, { InternalAxiosRequestConfig } from 'axios';
-import { SorobanRpc } from '@stellar/stellar-sdk';
 
 const TRACEPARENT_VERSION = '00';
 
@@ -58,8 +57,11 @@ export function propagateTraceParent(requestConfig: InternalAxiosRequestConfig):
 }
 
 // Registered once at module load. src/services/ipfs.ts (Pinata) makes its
-// calls through the default axios instance imported here; src/services/stellar.ts's
-// Soroban RPC server uses the Stellar SDK's own dedicated AxiosClient
-// instance, so it needs a separate interceptor.
+// calls through the default axios instance imported here.
+//
+// Note: In @stellar/stellar-sdk v16+ the Soroban RPC server switched its
+// internal HTTP client from axios to the platform's native fetch, so the
+// SDK no longer exposes an AxiosClient to intercept. Trace propagation for
+// Soroban RPC calls now relies on the OpenTelemetry auto-instrumentation
+// layer rather than an explicit axios interceptor.
 axios.interceptors.request.use(propagateTraceParent);
-SorobanRpc.AxiosClient.interceptors.request.use(propagateTraceParent);

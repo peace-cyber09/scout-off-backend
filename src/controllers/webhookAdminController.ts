@@ -27,40 +27,36 @@ export const listDeadLettersQuerySchema = z.object({
  * (first 200 chars of JSON), retry_count, last_error, and created_at.
  */
 export async function listDeadLetters(req: Request, res: Response, next: NextFunction) {
-  try {
-    const parsed = listDeadLettersQuerySchema.safeParse(req.query);
-    if (!parsed.success) {
-      res.status(400).json({
-        success: false,
-        error: parsed.error.errors[0]?.message ?? 'Invalid query parameters',
-      });
-      return;
-    }
-    const { page, pageSize } = parsed.data;
-    const offset = (page - 1) * pageSize;
-
-    const rows = listWebhookDeadLetters(pageSize, offset);
-    const total = countWebhookDeadLetters();
-
-    const data = rows.map((row) => ({
-      id: row.id,
-      subscriptionId: row.subscription_id,
-      url: row.url,
-      eventType: row.event_type,
-      // payload_preview: first 200 chars — enough to identify the event
-      // without sending the full body in a list response.
-      payloadPreview: row.payload.slice(0, 200),
-      retryCount: row.attempts,
-      lastError: row.failure_reason,
-      status: row.status,
-      createdAt: row.created_at,
-      replayedAt: row.replayed_at,
-    }));
-
-    res.json({ success: true, data, total, page, pageSize });
-  } catch (err) {
-    next(err);
+  const parsed = listDeadLettersQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      error: parsed.error.errors[0]?.message ?? 'Invalid query parameters',
+    });
+    return;
   }
+  const { page, pageSize } = parsed.data;
+  const offset = (page - 1) * pageSize;
+
+  const rows = listWebhookDeadLetters(pageSize, offset);
+  const total = countWebhookDeadLetters();
+
+  const data = rows.map((row) => ({
+    id: row.id,
+    subscriptionId: row.subscription_id,
+    url: row.url,
+    eventType: row.event_type,
+    // payload_preview: first 200 chars — enough to identify the event
+    // without sending the full body in a list response.
+    payloadPreview: row.payload.slice(0, 200),
+    retryCount: row.attempts,
+    lastError: row.failure_reason,
+    status: row.status,
+    createdAt: row.created_at,
+    replayedAt: row.replayed_at,
+  }));
+
+  res.json({ success: true, data, total, page, pageSize });
 }
 
 // ─── Param validation ─────────────────────────────────────────────────────────
@@ -78,7 +74,7 @@ const deadLetterIdSchema = z.object({
  * Re-signs the payload with the subscription's current secret.
  */
 export async function requeueDeadLetter(req: Request, res: Response, next: NextFunction) {
-  try {
+try {
     const parsedParams = deadLetterIdSchema.safeParse(req.params);
     if (!parsedParams.success) {
       res.status(400).json({
@@ -147,27 +143,23 @@ export async function requeueDeadLetter(req: Request, res: Response, next: NextF
  * Purge a specific dead-letter row.
  */
 export async function purgeDeadLetter(req: Request, res: Response, next: NextFunction) {
-  try {
-    const parsedParams = deadLetterIdSchema.safeParse(req.params);
-    if (!parsedParams.success) {
-      res.status(400).json({
-        success: false,
-        error: parsedParams.error.errors[0]?.message ?? 'Invalid id',
-      });
-      return;
-    }
-    const { id } = parsedParams.data;
-
-    const deleted = deleteWebhookDeadLetter(id);
-    if (!deleted) {
-      res.status(404).json({ success: false, error: 'Dead-lettered delivery not found' });
-      return;
-    }
-
-    res.json({ success: true, message: 'Dead letter purged', data: { id } });
-  } catch (err) {
-    next(err);
+  const parsedParams = deadLetterIdSchema.safeParse(req.params);
+  if (!parsedParams.success) {
+    res.status(400).json({
+      success: false,
+      error: parsedParams.error.errors[0]?.message ?? 'Invalid id',
+    });
+    return;
   }
+  const { id } = parsedParams.data;
+
+  const deleted = deleteWebhookDeadLetter(id);
+  if (!deleted) {
+    res.status(404).json({ success: false, error: 'Dead-lettered delivery not found' });
+    return;
+  }
+
+  res.json({ success: true, message: 'Dead letter purged', data: { id } });
 }
 
 // ─── DELETE /api/admin/webhooks/dead-letters ──────────────────────────────────
@@ -182,26 +174,22 @@ const purgeOldQuerySchema = z.object({
  * Purge all dead letters older than `olderThanDays` days (default: 7).
  */
 export async function purgeOldDeadLetters(req: Request, res: Response, next: NextFunction) {
-  try {
-    const parsed = purgeOldQuerySchema.safeParse(req.query);
-    if (!parsed.success) {
-      res.status(400).json({
-        success: false,
-        error: parsed.error.errors[0]?.message ?? 'Invalid query parameters',
-      });
-      return;
-    }
-    const { olderThanDays } = parsed.data;
-
-    const deleted = purgeOldWebhookDeadLetters(olderThanDays);
-    res.json({
-      success: true,
-      message: `Purged ${deleted} dead letter(s) older than ${olderThanDays} day(s)`,
-      data: { deleted, olderThanDays },
+  const parsed = purgeOldQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      error: parsed.error.errors[0]?.message ?? 'Invalid query parameters',
     });
-  } catch (err) {
-    next(err);
+    return;
   }
+  const { olderThanDays } = parsed.data;
+
+  const deleted = purgeOldWebhookDeadLetters(olderThanDays);
+  res.json({
+    success: true,
+    message: `Purged ${deleted} dead letter(s) older than ${olderThanDays} day(s)`,
+    data: { deleted, olderThanDays },
+  });
 }
 
 // ─── Legacy replay alias (kept for backwards compatibility) ──────────────────

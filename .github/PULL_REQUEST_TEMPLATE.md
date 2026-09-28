@@ -23,7 +23,7 @@ Closes #
 ## Documentation Checklist
 
 - [ ] README updated if user-facing behaviour changed.
-- [ ] BACKEND_API_DOCS.md updated for new or changed endpoints.
+- [ ] New or changed endpoints documented in a JSDoc comment above the route (see [docs/API_DOCUMENTATION.md](../docs/API_DOCUMENTATION.md)) — `npm run docs:check` and `npm run validate:openapi` verify this and run in CI.
 - [ ] `.env.example` updated for new environment variables.
 
 ## Migration Checklist (if applicable)

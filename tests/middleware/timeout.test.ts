@@ -6,7 +6,7 @@ jest.mock('../../src/config', () => ({
   default: { requestTimeoutMs: 100 },
 }));
 
-import { requestTimeout } from '../../src/middleware/timeout';
+import { requestTimeout, createTimeout } from '../../src/middleware/timeout';
 
 function makeReqRes() {
   const listeners: Record<string, (() => void)[]> = {};
@@ -37,6 +37,8 @@ function makeReqRes() {
   const next = jest.fn() as NextFunction;
   return { req, res, next };
 }
+
+// ─── Legacy requestTimeout (global default) ───────────────────────────────────
 
 describe('requestTimeout middleware', () => {
   beforeEach(() => jest.useFakeTimers());
@@ -84,5 +86,113 @@ describe('requestTimeout middleware', () => {
     jest.advanceTimersByTime(200);
     // headersSent=true prevents the json() call inside the timer
     expect(res._getBody()).toBeUndefined();
+  });
+});
+
+// ─── createTimeout — per-route overrides ─────────────────────────────────────
+
+describe('createTimeout(ms)', () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => {
+    jest.clearAllTimers();
+    jest.useRealTimers();
+  });
+
+  it('returns a middleware function', () => {
+    const mw = createTimeout(500);
+    expect(typeof mw).toBe('function');
+    expect(mw.length).toBe(3); // (req, res, next)
+  });
+
+  it('calls next() immediately', () => {
+    const { req, res, next } = makeReqRes();
+    createTimeout(500)(req, res, next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires 503 after the specified ms', () => {
+    const { req, res, next } = makeReqRes();
+    createTimeout(200)(req, res, next);
+    jest.advanceTimersByTime(199);
+    expect(res._getStatus()).toBe(0); // not yet
+    jest.advanceTimersByTime(1);
+    expect(res._getStatus()).toBe(503);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((res._getBody() as any).code).toBe('REQUEST_TIMEOUT');
+  });
+
+  it('does not fire before the specified ms', () => {
+    const { req, res, next } = makeReqRes();
+    createTimeout(300)(req, res, next);
+    jest.advanceTimersByTime(299);
+    expect(res._getStatus()).toBe(0);
+  });
+
+  it('clears the timer on finish', () => {
+    const { req, res, next } = makeReqRes();
+    createTimeout(200)(req, res, next);
+    res.emit('finish');
+    jest.advanceTimersByTime(300);
+    expect(res._getStatus()).toBe(0);
+  });
+
+  it('clears the timer on close', () => {
+    const { req, res, next } = makeReqRes();
+    createTimeout(200)(req, res, next);
+    res.emit('close');
+    jest.advanceTimersByTime(300);
+    expect(res._getStatus()).toBe(0);
+  });
+
+  it('does not send 503 when headers are already sent at fire time', () => {
+    const { req, res, next } = makeReqRes();
+    createTimeout(200)(req, res, next);
+    res.markSent();
+    jest.advanceTimersByTime(300);
+    expect(res._getBody()).toBeUndefined();
+  });
+
+  // ── Per-route override values ───────────────────────────────────────────────
+
+  it('createTimeout(0) never fires — models POST /api/admin/reindex (no timeout)', () => {
+    const { req, res, next } = makeReqRes();
+    createTimeout(0)(req, res, next);
+    // Advance far past any real timeout — nothing should fire
+    jest.advanceTimersByTime(9_999_999);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res._getStatus()).toBe(0);
+  });
+
+  it('createTimeout(120_000) fires after 120 s — models GET /api/admin/events/export', () => {
+    const { req, res, next } = makeReqRes();
+    createTimeout(120_000)(req, res, next);
+    jest.advanceTimersByTime(119_999);
+    expect(res._getStatus()).toBe(0); // not yet
+    jest.advanceTimersByTime(1);
+    expect(res._getStatus()).toBe(503);
+  });
+
+  it('createTimeout(5_000) fires after 5 s — models GET /health/liveness and /health/readiness', () => {
+    const { req, res, next } = makeReqRes();
+    createTimeout(5_000)(req, res, next);
+    jest.advanceTimersByTime(4_999);
+    expect(res._getStatus()).toBe(0); // not yet
+    jest.advanceTimersByTime(1);
+    expect(res._getStatus()).toBe(503);
+  });
+
+  it('different instances are independent — one firing does not affect the other', () => {
+    const r1 = makeReqRes();
+    const r2 = makeReqRes();
+
+    createTimeout(100)(r1.req, r1.res, r1.next);
+    createTimeout(300)(r2.req, r2.res, r2.next);
+
+    jest.advanceTimersByTime(150);
+    expect(r1.res._getStatus()).toBe(503); // short timeout fired
+    expect(r2.res._getStatus()).toBe(0);   // long timeout not yet
+
+    jest.advanceTimersByTime(200);
+    expect(r2.res._getStatus()).toBe(503); // long timeout now fired
   });
 });

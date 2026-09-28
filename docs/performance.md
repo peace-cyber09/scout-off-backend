@@ -179,6 +179,111 @@ The existing `scripts/loadtest.ts` (autocannon) is **preserved** for quick local
 | `scripts/loadtest.ts` (autocannon) | Quick local smoke test (3 endpoints, 30 s) | No |
 | `scripts/k6/suite.js` (k6) | Full regression suite with SLO enforcement (6 scenarios) | Yes — nightly |
 
+---
+
+## Redis Failure Behavior
+
+This section documents the verified behavior of the Redis-backed cache and
+rate-limit stores under failure conditions.  All behavior described here is
+covered by tests in `tests/services/redisCacheStore.failure.test.ts`,
+`tests/middleware/redisRateLimitStore.failure.test.ts`, and
+`tests/services/redisIntegration.failure.test.ts`.
+
+### Redis cache failure
+
+The cache layer degrades gracefully on any Redis error.  An unreachable or
+slow Redis connection never turns a cache failure into an application outage.
+
+| Failure scenario | `get()` behavior | `set()` behavior | `del()` / `deleteByPrefix()` behavior |
+|---|---|---|---|
+| Connection refused at startup | Returns `undefined` (cache miss) | Silently completes | Silently completes |
+| Connection drops mid-request | Returns `undefined` (cache miss) | Silently completes | Silently completes |
+| Command timeout | Returns `undefined` after rejection | Silently completes | Silently completes |
+| Recovery | Normal operation resumes | Normal operation resumes | Normal operation resumes |
+
+**Key properties:**
+- All `RedisCacheStore` methods resolve (never reject) on Redis failure.
+- Cache errors are logged at `warn` level — operators are alerted without
+  interrupting request handling.
+- Redis internals are never exposed to API clients.
+- The application takes the cache-miss/fallback path transparently.
+
+**Bounded timeout:** Redis operations are bounded by `commandTimeout: 2000 ms`
+on the shared ioredis client (`src/services/redis.ts`).  A hung Redis command
+will be rejected within 2 s.  The initial TCP handshake is bounded by
+`connectTimeout: 2000 ms`.
+
+### Redis rate-limit failure
+
+**Policy: FAIL OPEN**
+
+When Redis raises an error (connection refused, command timeout, or connection
+drop), the `rateLimit` middleware logs a warning and *allows the request*
+rather than rejecting it with HTTP 500.
+
+This is an explicit availability-over-security trade-off:
+
+- A Redis outage temporarily disables *distributed* throttling.
+- All API endpoints remain available to legitimate users during a Redis outage.
+- The failure is logged at `warn` level for operator visibility.
+- Per-instance in-process throttling via `InMemoryRateLimitStore` is NOT
+  automatically substituted — this is by design, as the two stores count
+  independently and would produce inconsistent limiting across instances.
+
+**Rationale:**  The protected endpoints are public and auth APIs that must
+remain available to legitimate users.  A Redis outage is an infrastructure
+failure, not itself an attack vector.  Operators who need fail-closed behavior
+for specific high-security routes should pass a custom `store` to `rateLimit()`
+that implements the desired policy.
+
+| Failure scenario | Rate-limit middleware behavior |
+|---|---|
+| Redis unreachable at startup | Fail open — request allowed |
+| Redis drops mid-request | Fail open — request allowed |
+| Redis command timeout | Fail open — request allowed after timeout |
+| Redis recovers | Normal rate limiting resumes |
+
+**Bounded timeout:** The same `commandTimeout: 2000 ms` applies to the rate
+limiter's Lua script (`INCR` + `PEXPIRE`).  A hung Redis command is rejected
+within 2 s, after which the middleware fails open within the same window.
+
+### Redis connection configuration
+
+The shared ioredis client (`src/services/redis.ts`) is configured with:
+
+| Option | Value | Purpose |
+|---|---|---|
+| `connectTimeout` | 2000 ms | Bounds initial TCP handshake |
+| `commandTimeout` | 2000 ms | Bounds any individual Redis command |
+| `maxRetriesPerRequest` | 0 | Rejects queued commands immediately on connection loss |
+| `lazyConnect` | true | Defers initial connection until first command |
+| `retryStrategy` | Exponential, max 10 attempts (~22 s) | Reconnects without a connection storm |
+
+### Operational expectations
+
+When Redis becomes unavailable:
+
+1. **Cache** — All cache reads return `undefined` (cache miss).  The
+   application falls through to the database / upstream for every request,
+   which increases load on the database.  Monitor cache hit rate and database
+   latency during extended Redis outages.
+
+2. **Rate limiting** — Distributed throttling is suspended.  The per-process
+   `InMemoryRateLimitStore` is NOT automatically activated.  Operators should
+   monitor Redis availability and consider activating emergency rate-limiting
+   measures if an outage is prolonged.
+
+3. **Latency** — During a Redis outage, each request adds at most
+   `commandTimeout` (2 s) of latency until the connection failure is detected.
+   After the first failure the ioredis client enters reconnect mode and
+   subsequent commands are rejected immediately (`maxRetriesPerRequest: 0`).
+
+4. **Recovery** — When Redis becomes healthy again, the cache and rate-limiter
+   automatically resume normal operation on the next request.  No process
+   restart is required.
+
+---
+
 ## Baseline
 
 > **Status: baseline not yet recorded — tracked in [issue #720](https://github.com/scout-off/scout-off-backend/issues/720).**

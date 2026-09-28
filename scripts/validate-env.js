@@ -114,7 +114,7 @@ function findStaleExampleKeys(examplePath, srcFiles) {
       .split('\n')
       .map((line) => line.replace(/\/\/.*$/, ''))
       .join('\n');
-    const matches = [...codeOnly.matchAll(/process\.env\.([A-Z_]+)/g)];
+    const matches = [...codeOnly.matchAll(/process\.env\.([A-Z_][A-Z0-9_]*)/g)];
     for (const [, key] of matches) {
       referencedKeys.add(key);
     }
@@ -162,7 +162,7 @@ if (require.main === module) {
       .split('\n')
       .map((line) => line.replace(/\/\/.*$/, ''))
       .join('\n');
-    const matches = [...codeOnly.matchAll(/process\.env\.([A-Z_]+)/g)];
+    const matches = [...codeOnly.matchAll(/process\.env\.([A-Z_][A-Z0-9_]*)/g)];
     for (const [, key] of matches) {
       if (!exampleKeys.has(key)) undocumented.push({ key, file });
     }

@@ -21,6 +21,17 @@ mod progress_invariants {
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
+    /// Number of cases to run per proptest! block. Defaults to 10 000 (the
+    /// project standard) but can be overridden via PROPTEST_CASES — e.g. CI
+    /// uses a smaller value for fast PR feedback within its time budget,
+    /// while nightly/local runs keep the full 10 000.
+    fn proptest_cases() -> u32 {
+        std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000)
+    }
+
     fn setup(
         env: &Env,
     ) -> (
@@ -67,7 +78,7 @@ mod progress_invariants {
     // ── P1: progress_level ∈ [0,3] and monotonically non-decreasing ──────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// Arbitrary sequences of identity/performance approvals must keep the player's
         /// progress_level in [0, 3] and must never decrease it.
@@ -109,7 +120,7 @@ mod progress_invariants {
     // ── P2: each milestone approved at most once ──────────────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// A second call to approve_milestone with the same milestone_id must always
         /// return an error regardless of how many milestones exist.
@@ -163,7 +174,7 @@ mod progress_invariants {
     // ── P3: approved milestone count never decreases ─────────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// For any n submit+approve pairs, get_milestones must return a list whose
         /// length equals n (approved) plus any pending ones; it must never shrink.
@@ -202,7 +213,7 @@ mod progress_invariants {
     // ── P4: unregistered validators cannot mutate state ───────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// Calls from an address that was never registered as a validator must be
         /// rejected for both submit_milestone and approve_milestone.
@@ -241,7 +252,7 @@ mod progress_invariants {
     // ── P5: type-to-level mapping is exact ────────────────────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// identity approval raises level to ≥ 1; performance approval raises level to ≥ 2.
         /// Verifying with a fresh player for each case guarantees starting from level 0.
@@ -275,7 +286,7 @@ mod progress_invariants {
     // ── P6: unknown milestone type is rejected at approval ────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// Submitting a milestone succeeds (type is stored as-is), but approving one
         /// whose type is neither "identity" nor "performance" must fail.

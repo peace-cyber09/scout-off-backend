@@ -43,6 +43,8 @@ jest.mock('../../src/db', () => ({
   getTrialOfferById: jest.fn(),
   insertTrialOffer: jest.fn(),
   respondToTrialOffer: jest.fn(),
+  cancelTrialOffer: jest.fn(),
+  insertAuditLog: jest.fn().mockResolvedValue(undefined),
 }));
 
 // Ensure we can update the player_registered event wallet in tests
@@ -67,6 +69,8 @@ const pendingOffer = {
   reject_reason: null,
   responded_at: null,
   created_at: Math.floor(Date.now() / 1000) - 3600,
+  expires_at: Math.floor(Date.now() / 1000) + 30 * 24 * 3600, // 30 days from now
+  cancelled_at: null,
 };
 
 beforeEach(() => {
@@ -247,5 +251,154 @@ describe(`POST /api/players/${PLAYER_ID}/trial-offers/${OFFER_ID}/reject`, () =>
       .send({});
 
     expect(res.status).toBe(409);
+  });
+});
+
+// ─── Shared ownership/lookup/status resolution (#1034) ────────────────────────
+
+/**
+ * accept and reject resolve the offer through one shared helper
+ * (`resolveOwnedPendingOffer`). These cases assert that both endpoints answer
+ * identically for every branch of that shared step, so the two can't drift.
+ */
+describe('accept and reject share offer resolution', () => {
+  const ENDPOINTS: ReadonlyArray<readonly [string, string]> = [
+    ['accept', `/api/players/${PLAYER_ID}/trial-offers/${OFFER_ID}/accept`],
+    ['reject', `/api/players/${PLAYER_ID}/trial-offers/${OFFER_ID}/reject`],
+  ];
+
+  describe.each(ENDPOINTS)('%s', (_action, url) => {
+    it('returns 404 when the playerId is not a registered player', async () => {
+      mockGetEvents.mockImplementation(() => []);
+      mockGetOffer.mockReturnValue(pendingOffer);
+
+      const token = makePlayerToken(PLAYER_WALLET);
+      const res = await request(app).post(url).set('Authorization', `Bearer ${token}`).send({});
+
+      expect(res.status).toBe(404);
+      expect(res.body.error).toMatch(/player not found/i);
+      expect(mockRespondOffer).not.toHaveBeenCalled();
+    });
+
+    it('returns 403 when the offer belongs to a different player', async () => {
+      mockGetOffer.mockReturnValue({ ...pendingOffer, player_id: 'someone-else' });
+
+      const token = makePlayerToken(PLAYER_WALLET);
+      const res = await request(app).post(url).set('Authorization', `Bearer ${token}`).send({});
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/does not belong/i);
+      expect(mockRespondOffer).not.toHaveBeenCalled();
+    });
+
+    it('seeds the offer from the indexed on-chain event when no row exists', async () => {
+      mockGetEvents.mockImplementation((type?: string) => {
+        if (type === 'player_registered') {
+          return [
+            {
+              source: 'contract',
+              type: 'player_registered',
+              contractAddress: 'contract',
+              payload: { player_id: PLAYER_ID, wallet: PLAYER_WALLET },
+            },
+          ];
+        }
+        if (type === 'trial_offer_logged') {
+          return [
+            {
+              source: 'contract',
+              type: 'trial_offer_logged',
+              contractAddress: 'contract',
+              payload: {
+                offer_id: OFFER_ID,
+                player_id: PLAYER_ID,
+                scout: SCOUT_WALLET,
+                details_uri: 'ipfs://on-chain-details',
+              },
+            },
+          ];
+        }
+        return [];
+      });
+      // Missing on first lookup, present once seeded from the on-chain event.
+      mockGetOffer.mockReturnValueOnce(null).mockReturnValue(pendingOffer);
+
+      const token = makePlayerToken(PLAYER_WALLET);
+      const res = await request(app).post(url).set('Authorization', `Bearer ${token}`).send({});
+
+      expect(res.status).toBe(200);
+      expect(mockInsertOffer).toHaveBeenCalledWith(
+        expect.objectContaining({
+          offer_id: OFFER_ID,
+          scout_wallet: SCOUT_WALLET,
+          player_id: PLAYER_ID,
+          details_uri: 'ipfs://on-chain-details',
+        }),
+      );
+      expect(mockRespondOffer).toHaveBeenCalledWith(
+        expect.objectContaining({ offer_id: OFFER_ID }),
+      );
+    });
+
+    it('returns 404 when neither a row nor an on-chain event exists', async () => {
+      mockGetOffer.mockReturnValue(null);
+
+      const token = makePlayerToken(PLAYER_WALLET);
+      const res = await request(app).post(url).set('Authorization', `Bearer ${token}`).send({});
+
+      expect(res.status).toBe(404);
+      expect(res.body.error).toMatch(/trial offer not found/i);
+      expect(mockInsertOffer).not.toHaveBeenCalled();
+      expect(mockRespondOffer).not.toHaveBeenCalled();
+    });
+  });
+});
+
+// ─── Expiry and cancellation guards (#expiry) ─────────────────────────────────
+
+describe('expired and cancelled offers cannot be accepted or rejected', () => {
+  const ENDPOINTS: ReadonlyArray<readonly [string, string]> = [
+    ['accept', `/api/players/${PLAYER_ID}/trial-offers/${OFFER_ID}/accept`],
+    ['reject', `/api/players/${PLAYER_ID}/trial-offers/${OFFER_ID}/reject`],
+  ];
+
+  describe.each(ENDPOINTS)('%s', (_action, url) => {
+    it('returns 410 when the offer has expired', async () => {
+      const pastExpiry = Math.floor(Date.now() / 1000) - 1; // 1 second ago
+      mockGetOffer.mockReturnValue({
+        ...pendingOffer,
+        expires_at: pastExpiry,
+      });
+
+      const token = makePlayerToken(PLAYER_WALLET);
+      const res = await request(app).post(url).set('Authorization', `Bearer ${token}`).send({});
+
+      expect(res.status).toBe(410);
+      expect(res.body.error).toMatch(/expired/i);
+      expect(mockRespondOffer).not.toHaveBeenCalled();
+    });
+
+    it('returns 410 when the offer has been cancelled by the scout', async () => {
+      const cancelledAt = Math.floor(Date.now() / 1000) - 60;
+      mockGetOffer.mockReturnValue({
+        ...pendingOffer,
+        cancelled_at: cancelledAt,
+      });
+
+      const token = makePlayerToken(PLAYER_WALLET);
+      const res = await request(app).post(url).set('Authorization', `Bearer ${token}`).send({});
+
+      expect(res.status).toBe(410);
+      expect(res.body.error).toMatch(/withdrawn/i);
+      expect(mockRespondOffer).not.toHaveBeenCalled();
+    });
+
+    it('still accepts/rejects a live non-expired non-cancelled offer', async () => {
+      mockGetOffer.mockReturnValue(pendingOffer); // has future expires_at and null cancelled_at
+      const token = makePlayerToken(PLAYER_WALLET);
+      const res = await request(app).post(url).set('Authorization', `Bearer ${token}`).send({});
+      expect(res.status).toBe(200);
+      expect(mockRespondOffer).toHaveBeenCalledTimes(1);
+    });
   });
 });

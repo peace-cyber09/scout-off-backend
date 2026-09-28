@@ -19,6 +19,7 @@ jest.mock('../../src/db', () => ({
   insertSubscription: jest.fn().mockReturnValue(1),
   deactivatePlayer: jest.fn(),
   reactivatePlayer: jest.fn(),
+  countTrialOffersByPlayer: jest.fn().mockReturnValue(0),
 }));
 
 jest.mock('../../src/services/indexer', () => ({
@@ -36,6 +37,8 @@ jest.mock('../../src/services/webhooks', () => ({
 }));
 
 jest.mock('../../src/services/cache', () => ({
+  getPlayerListLastModified: jest.fn(() => 0),
+  __setPlayerListLastModifiedForTests: jest.fn(),
   cacheGet: jest.fn().mockReturnValue(null),
   cacheSet: jest.fn(),
   invalidatePlayerCache: jest.fn(),

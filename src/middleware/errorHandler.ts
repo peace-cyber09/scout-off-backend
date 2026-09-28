@@ -7,6 +7,7 @@ import { ErrorCode } from '../utils/errorCodes';
 interface HttpError extends Error {
   type?: string;
   status?: number;
+  code?: string;
 }
 
 /**
@@ -15,6 +16,36 @@ interface HttpError extends Error {
  */
 function isValidErrorStatus(status: unknown): status is number {
   return typeof status === 'number' && status >= 400 && status <= 599;
+}
+
+/**
+ * Map HTTP status codes to appropriate error codes.
+ * This provides sensible defaults for status codes that don't have explicit error codes set.
+ */
+function getErrorCodeByStatus(status: number): ErrorCode {
+  switch (status) {
+    case 400:
+      return ErrorCode.VALIDATION_ERROR;
+    case 401:
+      return ErrorCode.UNAUTHORIZED;
+    case 403:
+      return ErrorCode.FORBIDDEN;
+    case 404:
+      return ErrorCode.NOT_FOUND;
+    case 409:
+      return ErrorCode.CONFLICT;
+    case 412:
+      return ErrorCode.PRECONDITION_FAILED;
+    case 413:
+      return ErrorCode.PAYLOAD_TOO_LARGE;
+    case 415:
+      return ErrorCode.UNSUPPORTED_MEDIA_TYPE;
+    case 428:
+      return ErrorCode.PRECONDITION_REQUIRED;
+    case 500:
+    default:
+      return ErrorCode.INTERNAL_SERVER_ERROR;
+  }
 }
 
 export function errorHandler(
@@ -75,10 +106,14 @@ export function errorHandler(
 
   const message = errMessage || 'Internal Server Error';
 
+  // Preserve explicit error codes if already set on the error object,
+  // otherwise determine the appropriate code based on HTTP status.
+  const code = httpErr?.code || getErrorCodeByStatus(status);
+
   const body: ApiResponse & { code: string; correlationId?: string } = {
     success: false,
     error: message,
-    code: status === 500 ? ErrorCode.INTERNAL_SERVER_ERROR : ErrorCode.VALIDATION_ERROR,
+    code,
     ...(correlationId !== undefined && { correlationId }),
   };
   res.status(status).json(body);

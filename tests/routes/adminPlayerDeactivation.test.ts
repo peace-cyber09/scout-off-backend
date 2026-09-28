@@ -53,6 +53,7 @@ jest.mock('../../src/db', () => ({
   queryEvents: jest.fn().mockReturnValue([]),
   queryPlayers: jest.fn().mockReturnValue([]),
   countPlayers: jest.fn().mockReturnValue(0),
+  searchPlayers: jest.fn().mockReturnValue({ data: [], nextCursor: null }),
   getEventsCount: jest.fn().mockReturnValue(0),
   fetchLastIndexedLedger: jest.fn().mockReturnValue(0),
   persistLastIndexedLedger: jest.fn(),
@@ -81,6 +82,8 @@ jest.mock('../../src/services/webhooks', () => ({
 }));
 
 jest.mock('../../src/services/cache', () => ({
+  getPlayerListLastModified: jest.fn(() => 0),
+  __setPlayerListLastModifiedForTests: jest.fn(),
   cacheGet: jest.fn().mockResolvedValue(null),
   cacheSet: jest.fn(),
   invalidatePlayerCache: jest.fn().mockResolvedValue(undefined),
@@ -128,7 +131,9 @@ describe('POST /api/admin/players/:playerId/deactivate', () => {
       .set('Authorization', `Bearer ${adminToken()}`)
       .send({});
     expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/reason/i);
+    // validateBody() reports the offending field in `details`; `error` is the
+    // generic "Validation Error" label.
+    expect(JSON.stringify(res.body)).toMatch(/reason/i);
   });
 
   it('returns 400 when reason is empty string', async () => {

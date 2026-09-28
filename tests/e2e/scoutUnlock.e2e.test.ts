@@ -17,6 +17,28 @@ import { getDb } from '../../src/db';
 const SECRET = process.env.JWT_SECRET ?? 'test-secret';
 const SCOUT_WALLET = Keypair.random().publicKey();
 const PLAYER_ID = 'player-unlock-e2e-1';
+const PLAYER_WALLET = Keypair.random().publicKey();
+
+/** Insert a player row so the unlock endpoint's player validation passes. */
+function insertPlayer(playerId: string, wallet: string): void {
+  getDb()
+    .prepare(
+      `INSERT INTO players (player_id, wallet, position, region, metadata_uri, progress_level, created_at, registered_at, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(player_id) DO NOTHING`,
+    )
+    .run(
+      playerId,
+      wallet,
+      'Forward',
+      'West Africa',
+      'ipfs://QmE2eContactMetadata',
+      1,
+      Date.now(),
+      Date.now(),
+      1,
+    );
+}
 
 jest.mock('../../src/services/ipfs', () => ({
   pinJson: jest.fn().mockResolvedValue('QmTestEvidenceCid'),
@@ -100,6 +122,7 @@ describe('E2E Subscribe → Unlock Contact Flow', () => {
     expect(subscriptionRes.body.data.tier).toBe('basic');
 
     // ── Step 2: unlock the player's contact ────────────────────────────────
+    insertPlayer(PLAYER_ID, PLAYER_WALLET);
     mockSubmitContactPayment.mockResolvedValue({ transactionId: 'tx-unlock-1', status: 'submitted' });
 
     const firstUnlockRes = await request(app)
@@ -168,5 +191,50 @@ describe('E2E Subscribe → Unlock Contact Flow', () => {
     expect(paymentsRes.body.data).toContainEqual(
       expect.objectContaining({ transactionId: 'tx-unlock-1', amount: '5', token: 'XLM' }),
     );
+  });
+
+  it('replays an Idempotency-Key from cache without submitting a second on-chain payment', async () => {
+    const scout2 = Keypair.random().publicKey();
+    const player2 = 'player-unlock-e2e-2';
+    const player2Wallet = Keypair.random().publicKey();
+    const token = makeToken(scout2);
+
+    // Clear call history accumulated by the previous test in this file.
+    mockSubmitContactPayment.mockClear();
+    insertPlayer(player2, player2Wallet);
+    mockSubmitContactPayment.mockResolvedValue({ transactionId: 'tx-unlock-idem', status: 'submitted' });
+
+    const first = await request(app)
+      .post(`/api/scouts/${scout2}/contacts/${player2}/unlock`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'e2e-idem-key')
+      .send({});
+
+    expect(first.status).toBe(200);
+    expect(first.body.success).toBe(true);
+    expect(mockSubmitContactPayment).toHaveBeenCalledTimes(1);
+
+    // Same key, same request → cached response, no second transaction.
+    const replay = await request(app)
+      .post(`/api/scouts/${scout2}/contacts/${player2}/unlock`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'e2e-idem-key')
+      .send({});
+
+    expect(replay.status).toBe(200);
+    expect(replay.body).toEqual(first.body);
+    expect(mockSubmitContactPayment).toHaveBeenCalledTimes(1);
+
+    // Conflicting request (different player) with the same key → 409, no payment.
+    const player3 = 'player-unlock-e2e-3';
+    insertPlayer(player3, Keypair.random().publicKey());
+    const conflict = await request(app)
+      .post(`/api/scouts/${scout2}/contacts/${player3}/unlock`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'e2e-idem-key')
+      .send({});
+
+    expect(conflict.status).toBe(409);
+    expect(mockSubmitContactPayment).toHaveBeenCalledTimes(1);
   });
 });

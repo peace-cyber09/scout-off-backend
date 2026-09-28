@@ -1,12 +1,14 @@
 import { server } from './stellar';
+import { scValToNative } from '@stellar/stellar-sdk';
+import { trace, SpanStatusCode } from '@opentelemetry/api';
 import config from '../config';
 import {
   getDb,
+  getDriver,
   fetchLastIndexedLedger,
   persistLastIndexedLedger,
   insertOrUpdatePlayer,
   updatePlayerProgress,
-  getEvents,
   insertPendingMilestone,
   queryEvents,
   rollbackEventsFromLedger,
@@ -14,6 +16,14 @@ import {
 import { dispatchEventWebhook } from './webhooks';
 import { logger } from '../utils/logger';
 import { tierForApprovedMilestones } from './tierPromotion';
+import {
+  normalizeAndSortEvents,
+  groupCoTransactionEvents,
+  type RawIndexerEvent,
+} from './eventOrdering';
+import { withRestoredCorrelation } from './txCorrelation';
+
+const tracer = trace.getTracer('scout-off-backend');
 
 // Lazy import cache service to avoid circular dependency
 function getCache() {
@@ -55,25 +65,29 @@ export function normalizePayload(payload: Record<string, unknown>): Record<strin
 
 // ─── Deduplication strategy ───────────────────────────────────────────────────
 //
-// Primary deduplication: the `events` table has a UNIQUE constraint on `tx_hash`.
-// INSERT OR IGNORE silently discards any row whose tx_hash already exists, so
-// replaying the same ledger range is safe and idempotent.
+// Primary deduplication: UNIQUE(tx_hash, event_index) — co-transaction events
+// are retained; replays of the same (tx, index) are ignored.
 //
 // Canonical event ID: each event is identified by the tuple
-//   (contractId, ledger, txHash, topicIndex)
-// normalizeEventId() encodes this as a single opaque string that can be used
-// for in-memory dedup checks before hitting the DB (e.g. in tests or caches).
+//   (contractId, ledger, txHash, eventIndex)
+// normalizeEventId() encodes this as a single opaque string.
 //
-// Stub hooks (onBeforeInsert / onAfterInsert) are called around every insert so
-// future logic (metrics, alerting, secondary caches) can be added without
-// touching the core indexing loop.
+// Total order (#1111): events are sorted by
+//   (ledger, tx_application_order, event_index, contract_id)
+// before insert and side-effect application. Co-transaction groups are applied
+// atomically (all inserts + side effects for one tx before the next tx).
 
 /**
  * Returns a canonical, stable ID for a contract event.
- * Format: `<contractId>:<ledger>:<txHash>`
+ * Format: `<contractId>:<ledger>:<txHash>:<eventIndex>`
  */
-export function normalizeEventId(contractId: string, ledger: number, txHash: string): string {
-  return `${contractId}:${ledger}:${txHash}`;
+export function normalizeEventId(
+  contractId: string,
+  ledger: number,
+  txHash: string,
+  eventIndex = 0,
+): string {
+  return `${contractId}:${ledger}:${txHash}:${eventIndex}`;
 }
 
 // Stub hook — replace with real logic as needed (e.g. metrics, alerting).
@@ -87,19 +101,35 @@ function onAfterInsert(_eventId: string): void { /* hook */ }
 // ─── Indexer ──────────────────────────────────────────────────────────────────
 
 export async function indexEvents(): Promise<void> {
+  return tracer.startActiveSpan('indexer.poll', async (span) => {
+  try {
   const db = getDb();
   const insert = db.prepare(
-    'INSERT OR IGNORE INTO events (type, ledger, ledger_hash, tx_hash, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+    `INSERT OR IGNORE INTO events
+      (type, ledger, ledger_hash, tx_hash, payload, created_at,
+       tx_application_order, event_index, contract_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   const lastIndexed = fetchLastIndexedLedger();
   const margin = getFinalityMargin();
   const fromLedger = Math.max(0, lastIndexed > margin ? lastIndexed - margin : 0);
+  span.setAttribute('indexer.ledger_start', fromLedger);
+
+  const contractIds = [
+    config.contractId,
+    config.registerContractId,
+    config.progressContractId,
+    config.subscriptionContractId,
+    config.connectionContractId,
+  ].filter((id, i, arr) => Boolean(id) && arr.indexOf(id) === i);
 
   const response = await server.getEvents({
-    startLedger: fromLedger || undefined,
-    filters: [{ type: 'contract', contractIds: [config.contractId] }],
+    startLedger: fromLedger > 0 ? fromLedger : 1,
+    filters: [{ type: 'contract', contractIds: contractIds.length ? contractIds : [config.contractId] }],
   });
+  span.setAttribute('indexer.ledger_end', response.latestLedger);
+  span.setAttribute('indexer.events_processed', response.events.length);
 
   const lagAfterPoll = Math.max(0, response.latestLedger - (lastIndexed > 0 ? lastIndexed - 1 : response.latestLedger));
   indexerLedgerLag = lagAfterPoll;
@@ -110,97 +140,208 @@ export async function indexEvents(): Promise<void> {
 
   if (!response.events.length) return;
 
-  const webhookEvents: Array<{ type: string; payload: unknown }> = [];
+  const webhookEvents: Array<{ type: string; payload: unknown; txHash: string }> = [];
 
-  const processBatch = db.transaction((events: typeof response.events) => {
-    // 1. Reorg detection
-    const overlappingEvents = db.prepare('SELECT ledger, ledger_hash FROM events WHERE ledger >= ?').all(fromLedger) as { ledger: number, ledger_hash: string | null }[];
-    const existingHashes = new Map<number, string>();
-    for (const row of overlappingEvents) {
-      if (row.ledger_hash) existingHashes.set(row.ledger, row.ledger_hash);
+  // NOTE: this used to be (and, on main, still is) a single synchronous
+  // db.transaction() wrapping the whole batch, including reorg detection.
+  // insertOrUpdatePlayer/insertPendingMilestone/updatePlayerProgress now go
+  // through the async DbDriver (required to support DB_DRIVER=postgres), so
+  // they can no longer run inside a synchronous better-sqlite3 transaction
+  // callback — reorg detection and the events-table insert itself (both
+  // owned by the event-indexing subsystem) still go through the raw
+  // synchronous getDb() handle unchanged, but player/milestone upserts run
+  // as a separate async loop below rather than inside one atomic
+  // transaction. Losing whole-batch atomicity here is safe: every insert
+  // below is idempotent (events dedup on (tx_hash, event_index) via
+  // INSERT OR IGNORE, player/milestone upserts are keyed and re-appliable),
+  // so a mid-batch failure just gets safely reprocessed on the next poll
+  // from the same fromLedger.
+  //
+  // Co-transaction atomicity (#1111): within a single transaction's event
+  // group we still apply inserts + side effects sequentially before moving
+  // to the next transaction so order-sensitive consumers never see a later
+  // sibling before an earlier one.
+
+  // 1. Reorg detection
+  const overlappingEvents = db.prepare('SELECT ledger, ledger_hash FROM events WHERE ledger >= ?').all(fromLedger) as { ledger: number, ledger_hash: string | null }[];
+  const existingHashes = new Map<number, string>();
+  for (const row of overlappingEvents) {
+    if (row.ledger_hash) existingHashes.set(row.ledger, row.ledger_hash);
+  }
+
+  let reorgLedger: number | null = null;
+  for (const raw of response.events) {
+    const existingHash = existingHashes.get(raw.ledger);
+    const incomingHash = (raw as any).ledgerHash ?? (raw as any).pagingToken ?? raw.txHash;
+    if (existingHash && incomingHash && existingHash !== incomingHash) {
+      reorgLedger = raw.ledger;
+      break;
     }
+  }
 
-    let reorgLedger: number | null = null;
-    for (const raw of events) {
-      const existingHash = existingHashes.get(raw.ledger);
-      const incomingHash = (raw as any).ledgerHash ?? (raw as any).pagingToken ?? raw.txHash;
-      if (existingHash && incomingHash && existingHash !== incomingHash) {
-        reorgLedger = raw.ledger;
-        break;
-      }
-    }
+  if (reorgLedger !== null) {
+    logger.warn(`[indexer] Reorg detected at ledger ${reorgLedger}! Rolling back...`);
+    rollbackEventsFromLedger(reorgLedger);
+  }
 
-    if (reorgLedger !== null) {
-      logger.warn(`[indexer] Reorg detected at ledger ${reorgLedger}! Rolling back...`);
-      rollbackEventsFromLedger(reorgLedger);
-    }
+  // 2. Normalize + sort into deterministic total order, then apply as
+  //    co-transaction atomic groups regardless of RPC return order.
+  const rawEvents: RawIndexerEvent[] = response.events.map((raw: any) => ({
+    ledger: raw.ledger,
+    txHash: raw.txHash,
+    id: raw.id,
+    contractId: raw.contractId ?? config.contractId,
+    topic: raw.topic,
+    value: raw.value,
+    ledgerClosedAt: raw.ledgerClosedAt,
+    ledgerHash: raw.ledgerHash,
+    pagingToken: raw.pagingToken,
+    txIndex: raw.txIndex,
+    eventIndex: raw.eventIndex,
+  }));
 
-    // 2. Insert events
-    for (const raw of events) {
-      const type = raw.topic[0]?.value() as string;
-      const payload = normalizePayload((raw.value?.value() as unknown as Record<string, unknown>) ?? {});
-      const eventId = normalizeEventId(config.contractId, raw.ledger, raw.txHash);
-      const createdAt = raw.ledgerClosedAt ? new Date(raw.ledgerClosedAt).getTime() : Date.now();
-      const ledgerHash = (raw as any).ledgerHash ?? (raw as any).pagingToken ?? raw.txHash;
+  const ordered = normalizeAndSortEvents(rawEvents, config.contractId);
+  const groups = groupCoTransactionEvents(ordered);
 
-      onBeforeInsert(eventId);
-      insert.run(type, raw.ledger, ledgerHash, raw.txHash, JSON.stringify(payload), createdAt);
-      onAfterInsert(eventId);
+  const applyOne = async (event: (typeof ordered)[number]): Promise<void> => {
+    const raw = event.raw as any;
+    const type = raw.topic?.[0] ? (scValToNative(raw.topic[0]) as string) : '';
+    const payload = normalizePayload(
+      (raw.value ? (scValToNative(raw.value) as Record<string, unknown>) : {}) ?? {},
+    );
+    const eventId = normalizeEventId(
+      event.contractId,
+      event.ledger,
+      event.txHash,
+      event.eventIndex,
+    );
+    const createdAt = raw.ledgerClosedAt ? new Date(raw.ledgerClosedAt).getTime() : Date.now();
+    const ledgerHash = raw.ledgerHash ?? raw.pagingToken ?? raw.txHash;
 
-      if (type === 'player_registered') {
-        const playerId = payload.player_id as string;
-        insertOrUpdatePlayer({
-          player_id: playerId,
-          wallet: payload.wallet as string,
-          position: payload.position as string | undefined,
-          region: payload.region as string | undefined,
-          metadata_uri: payload.metadata_uri as string | undefined,
-          created_at: raw.ledger,
-        });
-        // Invalidate cache after player registration
-        const cache = getCache();
-        cache.invalidatePlayerCache(playerId);
-      } else if (type === 'milestone_submitted') {
-        const milestoneId = payload.milestone_id as string;
-        const playerId = payload.player_id as string;
-        const validatorWallet = payload.validator as string;
-        const milestoneType = payload.milestone_type as string;
-        const evidenceUri = payload.evidence_uri as string;
-        const submittedAt = raw.ledger;
-        if (milestoneId && playerId && validatorWallet) {
-          insertPendingMilestone(milestoneId, playerId, validatorWallet, milestoneType, evidenceUri, submittedAt);
+    onBeforeInsert(eventId);
+    insert.run(
+      type,
+      event.ledger,
+      ledgerHash,
+      event.txHash,
+      JSON.stringify(payload),
+      createdAt,
+      event.txApplicationOrder,
+      event.eventIndex,
+      event.contractId,
+    );
+    onAfterInsert(eventId);
+
+    await withRestoredCorrelation(
+      event.txHash,
+      'indexer.applyEvent',
+      async (correlationId) => {
+        if (correlationId) {
+          logger.debug(
+            `[indexer] restored correlationId=${correlationId} for tx=${event.txHash}`,
+          );
         }
-        webhookEvents.push({ type, payload });
-      } else if (type === 'milestone_approved') {
-        const playerId = payload.player_id as string;
-        if (playerId) {
-          const approvedMilestoneCount = queryEvents('milestone_approved').filter(
-            (e) => e.payload.player_id === playerId,
-          ).length;
-          updatePlayerProgress(playerId, tierForApprovedMilestones(approvedMilestoneCount));
-          // Invalidate cache after player progress update
+
+        if (type === 'player_registered') {
+          const playerId = payload.player_id as string;
+          const registeredAt = raw.ledgerClosedAt
+            ? new Date(raw.ledgerClosedAt).getTime()
+            : Date.now();
+          await insertOrUpdatePlayer({
+            player_id: playerId,
+            wallet: payload.wallet as string,
+            position: payload.position as string | undefined,
+            region: payload.region as string | undefined,
+            metadata_uri: payload.metadata_uri as string | undefined,
+            created_at: registeredAt,
+            registered_at: registeredAt,
+          });
           const cache = getCache();
           cache.invalidatePlayerCache(playerId);
+        } else if (type === 'milestone_submitted') {
+          const milestoneId = payload.milestone_id as string;
+          const playerId = payload.player_id as string;
+          const validatorWallet = payload.validator as string;
+          const milestoneType = payload.milestone_type as string;
+          const evidenceUri = payload.evidence_uri as string;
+          const submittedAt = raw.ledger;
+          // milestone_type / evidence_uri back non-nullable columns, so a
+          // malformed on-chain event that omits either is skipped (logged)
+          // rather than allowed to abort the whole batch with a constraint
+          // error — the raw event row is still recorded above.
+          if (milestoneId && playerId && validatorWallet && milestoneType && evidenceUri) {
+            await insertPendingMilestone(
+              milestoneId,
+              playerId,
+              validatorWallet,
+              milestoneType,
+              evidenceUri,
+              submittedAt,
+            );
+          } else {
+            logger.warn(
+              `[indexer] skipping malformed milestone_submitted event tx=${event.txHash} ` +
+              `(missing ${[
+                !milestoneId && 'milestone_id',
+                !playerId && 'player_id',
+                !validatorWallet && 'validator',
+                !milestoneType && 'milestone_type',
+                !evidenceUri && 'evidence_uri',
+              ].filter(Boolean).join(', ')})`,
+            );
+          }
+          webhookEvents.push({ type, payload, txHash: event.txHash });
+        } else if (type === 'milestone_approved') {
+          const playerId = payload.player_id as string;
+          if (playerId) {
+            const approvedMilestoneCount = queryEvents('milestone_approved').filter(
+              (e) => e.payload.player_id === playerId,
+            ).length;
+            await updatePlayerProgress(
+              playerId,
+              tierForApprovedMilestones(approvedMilestoneCount),
+            );
+            const cache = getCache();
+            cache.invalidatePlayerCache(playerId);
+          }
+          webhookEvents.push({ type, payload, txHash: event.txHash });
         }
-        webhookEvents.push({ type, payload });
-      }
+      },
+      span,
+    );
+  };
+
+  for (const group of groups) {
+    // Atomic co-transaction group: apply every event in order before the next tx.
+    for (const event of group) {
+      await applyOne(event);
     }
+  }
 
-    // 3. Update last indexed ledger safely inside the transaction!
-    const latest = events.at(-1)!;
-    persistLastIndexedLedger(latest.ledger + 1);
-  });
+  const latest = ordered.at(-1)!;
 
-  processBatch(response.events);
+  // 3. Update last indexed ledger once the batch above has been applied.
+  persistLastIndexedLedger(latest.ledger + 1);
 
-  for (const { type, payload } of webhookEvents) {
-    dispatchEventWebhook(type, payload).catch((err: unknown) => {
-      logger.warn(`[indexer] webhook dispatch failed for ${type}: ${err instanceof Error ? err.message : String(err)}`);
+  for (const { type, payload, txHash } of webhookEvents) {
+    withRestoredCorrelation(txHash, 'indexer.webhookDispatch', async () => {
+      await dispatchEventWebhook(type, payload);
+    }, span).catch((err: unknown) => {
+      logger.warn(
+        `[indexer] webhook dispatch failed for ${type}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     });
   }
 
-  const latest = response.events.at(-1)!;
   indexerLedgerLag = Math.max(0, response.latestLedger - latest.ledger);
+  } catch (err) {
+    span.recordException(err as Error);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+    throw err;
+  } finally {
+    span.end();
+  }
+  });
 }
 
 // ─── Trial offer event log (#285) ──────────────────────────────────────────────
@@ -214,28 +355,31 @@ export interface TrialOfferEventRow {
 }
 
 /**
- * Persist an on-chain trial offer submission. Deduped by tx_hash (INSERT OR
- * IGNORE) so replaying the same on-chain event never creates duplicate rows.
+ * Persist an on-chain trial offer submission. Deduped by tx_hash (ON
+ * CONFLICT DO NOTHING) so replaying the same on-chain event never creates
+ * duplicate rows.
  */
-export function insertTrialOffer(
+export async function insertTrialOffer(
   scoutWallet: string,
   playerId: string,
   detailsUri: string,
   txHash: string,
   createdAt: number,
-): void {
-  getDb().prepare(
-    `INSERT OR IGNORE INTO trial_offer_events (scout_wallet, player_id, details_uri, tx_hash, created_at)
-     VALUES (?, ?, ?, ?, ?)`
-  ).run(scoutWallet, playerId, detailsUri, txHash, createdAt);
+): Promise<void> {
+  await getDriver().run(
+    `INSERT INTO trial_offer_events (scout_wallet, player_id, details_uri, tx_hash, created_at)
+     VALUES (?, ?, ?, ?, ?) ON CONFLICT (tx_hash) DO NOTHING`,
+    [scoutWallet, playerId, detailsUri, txHash, createdAt],
+  );
 }
 
 /** Return all trial offer events for a scout wallet, most recent first. */
-export function getTrialOffers(scoutWallet: string): TrialOfferEventRow[] {
-  return getDb().prepare(
+export async function getTrialOffers(scoutWallet: string): Promise<TrialOfferEventRow[]> {
+  return getDriver().all<TrialOfferEventRow>(
     `SELECT scout_wallet, player_id, details_uri, tx_hash, created_at
-     FROM trial_offer_events WHERE scout_wallet = ? ORDER BY created_at DESC`
-  ).all(scoutWallet) as TrialOfferEventRow[];
+     FROM trial_offer_events WHERE scout_wallet = ? ORDER BY created_at DESC`,
+    [scoutWallet],
+  );
 }
 
 // ─── Validator registry helpers ───────────────────────────────────────────────
@@ -249,40 +393,50 @@ export interface ValidatorRow {
 
 /**
  * Insert a newly registered validator into the local DB.
- * Uses INSERT OR REPLACE so a re-registration after revocation resets the row.
+ * Uses ON CONFLICT DO UPDATE so a re-registration after revocation resets
+ * the row (equivalent to the old INSERT OR REPLACE, but portable — REPLACE
+ * is SQLite-only syntax).
  */
-export function insertValidator(wallet: string, txHash?: string): void {
-  getDb().prepare(
-    `INSERT OR REPLACE INTO validators (wallet, registered_at, revoked_at, tx_hash)
-     VALUES (?, ?, NULL, ?)`
-  ).run(wallet, Math.floor(Date.now() / 1000), txHash ?? null);
+export async function insertValidator(wallet: string, txHash?: string): Promise<void> {
+  await getDriver().run(
+    `INSERT INTO validators (wallet, registered_at, revoked_at, tx_hash)
+     VALUES (?, ?, NULL, ?)
+     ON CONFLICT (wallet) DO UPDATE SET
+       registered_at = excluded.registered_at,
+       revoked_at = NULL,
+       tx_hash = excluded.tx_hash`,
+    [wallet, Math.floor(Date.now() / 1000), txHash ?? null],
+  );
 }
 
 /**
  * Mark an existing validator as revoked by setting revoked_at.
  * No-op if the wallet is not found.
  */
-export function revokeValidatorRow(wallet: string, txHash?: string): void {
-  getDb().prepare(
-    `UPDATE validators SET revoked_at = ?, tx_hash = ? WHERE wallet = ?`
-  ).run(Math.floor(Date.now() / 1000), txHash ?? null, wallet);
+export async function revokeValidatorRow(wallet: string, txHash?: string): Promise<void> {
+  await getDriver().run(
+    `UPDATE validators SET revoked_at = ?, tx_hash = ? WHERE wallet = ?`,
+    [Math.floor(Date.now() / 1000), txHash ?? null, wallet],
+  );
 }
 
 /**
  * Return all validator rows ordered by registration time descending.
  */
-export function getAllValidators(): ValidatorRow[] {
-  return getDb().prepare(
-    `SELECT wallet, registered_at, revoked_at, tx_hash FROM validators ORDER BY registered_at DESC`
-  ).all() as ValidatorRow[];
+export async function getAllValidators(): Promise<ValidatorRow[]> {
+  return getDriver().all<ValidatorRow>(
+    `SELECT wallet, registered_at, revoked_at, tx_hash FROM validators ORDER BY registered_at DESC`,
+  );
 }
 
 /**
  * Return a single validator row by wallet address, or null if not found.
  */
-export function getValidatorByWallet(wallet: string): ValidatorRow | null {
-  return (getDb().prepare(
-    `SELECT wallet, registered_at, revoked_at, tx_hash FROM validators WHERE wallet = ?`
-  ).get(wallet) as ValidatorRow | undefined) ?? null;
+export async function getValidatorByWallet(wallet: string): Promise<ValidatorRow | null> {
+  return (
+    (await getDriver().get<ValidatorRow>(
+      `SELECT wallet, registered_at, revoked_at, tx_hash FROM validators WHERE wallet = ?`,
+      [wallet],
+    )) ?? null
+  );
 }
-

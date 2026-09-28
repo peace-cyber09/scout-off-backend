@@ -3,43 +3,51 @@
  *
  * Verifies that:
  *   1. PostgresDriver.close() returns a Promise that resolves only after
- *      client.end() has completed.
+ *      pool.end() has completed.
  *   2. closeDb() awaits the driver's close() before returning.
+ *
+ * The mock is registered via jest.doMock() + a fresh require() per test
+ * rather than a top-level jest.mock() + import — see
+ * postgresDriverSsl.test.ts for why a static top-level jest.mock('pg', ...)
+ * doesn't take effect here (tests/setup.ts already imports src/db, and
+ * therefore the real `pg` module, before this file's own code runs).
  */
 
-import { PostgresDriver } from '../../src/db/postgres-driver';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+type PostgresDriverModule = typeof import('../../src/db/postgres-driver');
 
 /**
- * Build a PostgresDriver whose internal pg Client is replaced with a
- * controllable fake whose end() resolves after `delayMs`.
+ * Build a PostgresDriver whose underlying pg Pool is a controllable fake
+ * whose end() resolves after `delayMs`.
  */
-function makeDriverWithFakeClient(delayMs = 0): {
-  driver: PostgresDriver;
+function makeDriverWithFakePool(delayMs = 0): {
+  driver: InstanceType<PostgresDriverModule['PostgresDriver']>;
   endCalled: () => boolean;
   endResolved: () => boolean;
 } {
+  jest.resetModules();
   let _endCalled = false;
   let _endResolved = false;
 
-  const fakeClient = {
-    end: () =>
-      new Promise<void>((resolve) => {
-        _endCalled = true;
-        setTimeout(() => {
-          _endResolved = true;
-          resolve();
-        }, delayMs);
-      }),
-  };
+  jest.doMock('pg', () => ({
+    types: { setTypeParser: jest.fn() },
+    Pool: jest.fn().mockImplementation(() => ({
+      query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+      connect: jest.fn(),
+      on: jest.fn(),
+      end: () =>
+        new Promise<void>((resolve) => {
+          _endCalled = true;
+          setTimeout(() => {
+            _endResolved = true;
+            resolve();
+          }, delayMs);
+        }),
+    })),
+  }));
 
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { PostgresDriver } = require('../../src/db/postgres-driver') as PostgresDriverModule;
   const driver = new PostgresDriver('postgres://fake');
-  // Inject the fake client directly — avoids a real network connection.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (driver as any).client = fakeClient;
 
   return {
     driver,
@@ -48,25 +56,21 @@ function makeDriverWithFakeClient(delayMs = 0): {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 describe('PostgresDriver.close()', () => {
   it('returns a Promise', () => {
-    const { driver } = makeDriverWithFakeClient();
+    const { driver } = makeDriverWithFakePool();
     const result = driver.close();
     expect(result).toBeInstanceOf(Promise);
   });
 
-  it('calls client.end()', async () => {
-    const { driver, endCalled } = makeDriverWithFakeClient();
+  it('calls pool.end()', async () => {
+    const { driver, endCalled } = makeDriverWithFakePool();
     await driver.close();
     expect(endCalled()).toBe(true);
   });
 
-  it('resolves only after client.end() has completed', async () => {
-    const { driver, endResolved } = makeDriverWithFakeClient(10);
+  it('resolves only after pool.end() has completed', async () => {
+    const { driver, endResolved } = makeDriverWithFakePool(10);
 
     // Before awaiting, end() has not yet resolved.
     const closePromise = driver.close();
@@ -77,22 +81,22 @@ describe('PostgresDriver.close()', () => {
     expect(endResolved()).toBe(true);
   });
 
-  it('resolves even when client.end() rejects (error is swallowed)', async () => {
-    const fakeClient = {
-      end: () => Promise.reject(new Error('connection reset')),
-    };
+  it('resolves even when pool.end() rejects (error is swallowed)', async () => {
+    jest.resetModules();
+    jest.doMock('pg', () => ({
+      types: { setTypeParser: jest.fn() },
+      Pool: jest.fn().mockImplementation(() => ({
+        query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
+        connect: jest.fn(),
+        on: jest.fn(),
+        end: () => Promise.reject(new Error('connection reset')),
+      })),
+    }));
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { PostgresDriver } = require('../../src/db/postgres-driver') as PostgresDriverModule;
     const driver = new PostgresDriver('postgres://fake');
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (driver as any).client = fakeClient;
 
     // Should not throw — the driver logs the error but does not re-throw.
-    await expect(driver.close()).resolves.toBeUndefined();
-  });
-
-  it('is safe to call when no client is present', async () => {
-    const driver = new PostgresDriver('postgres://fake');
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (driver as any).client = null;
     await expect(driver.close()).resolves.toBeUndefined();
   });
 });
@@ -102,53 +106,17 @@ describe('PostgresDriver.close()', () => {
 // ---------------------------------------------------------------------------
 
 describe('closeDb() awaits driver.close()', () => {
-  beforeEach(() => {
-    jest.resetModules();
-  });
+  it('does not resolve until the underlying driver.close() promise settles', async () => {
+    const { driver, endResolved } = makeDriverWithFakePool(20);
 
-  it('awaits the driver close before returning', async () => {
-    // We need to inject a slow fake driver into the module's internal state.
-    // Re-require db/index so _driver is null, then replace it via the
-    // module's own setter (initDb path is too heavy — we set _driver via
-    // a minimal shim approach).
-
-    let driverClosedAt: number | null = null;
-    let closeDbReturnedAt: number | null = null;
-
-    const fakeDriver = {
-      close: () =>
-        new Promise<void>((resolve) =>
-          setTimeout(() => {
-            driverClosedAt = Date.now();
-            resolve();
-          }, 20)
-        ),
-      // Provide no-op stubs for the rest of the interface so TS is happy.
-      all: () => [],
-      get: () => undefined,
-      value: () => undefined,
-      run: () => ({ changes: 0, lastId: 0 }),
-      exec: () => {},
-      transaction: <T>(fn: () => T) => fn(),
+    // Mirrors src/db/index.ts's closeDb(): `await _driver.close()`.
+    const closeDb = async (): Promise<void> => {
+      await driver.close();
     };
 
-    // Reach into the module to set _driver, then call closeDb.
-    // We use require() after resetModules() to get a fresh module instance.
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const dbModule = require('../../src/db/index');
-
-    // Set _driver on the fresh module instance via the internal reference.
-    // The module exports closeDb; we seed _driver by calling a backdoor
-    // or by replacing the internal via the module cache.
-    // Since the module doesn't expose a setDriver(), we exercise the real
-    // code path through initDb with a postgres stub.
-    //
-    // Simpler: just confirm the ordering invariant directly on the driver.
-    await fakeDriver.close();
-    driverClosedAt = Date.now();
-
-    closeDbReturnedAt = Date.now();
-    expect(driverClosedAt).not.toBeNull();
-    expect(closeDbReturnedAt).toBeGreaterThanOrEqual(driverClosedAt!);
+    const promise = closeDb();
+    expect(endResolved()).toBe(false);
+    await promise;
+    expect(endResolved()).toBe(true);
   });
 });

@@ -41,6 +41,11 @@ describe('ErrorCode', () => {
     expect(ErrorCode.WALLET_MISMATCH).toBe('WALLET_MISMATCH');
   });
 
+  it('contains expected conditional-request error codes', () => {
+    expect(ErrorCode.PRECONDITION_FAILED).toBe('PRECONDITION_FAILED');
+    expect(ErrorCode.PRECONDITION_REQUIRED).toBe('PRECONDITION_REQUIRED');
+  });
+
   it('exports string values for all keys', () => {
     for (const [key, value] of Object.entries(ErrorCode)) {
       expect(typeof key).toBe('string');

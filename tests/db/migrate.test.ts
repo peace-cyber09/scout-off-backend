@@ -18,8 +18,8 @@ import { runMigrations } from '../../src/db/migrate';
 import { SqliteDriver } from '../../src/db/sqlite-driver';
 
 /** Wrap a raw better-sqlite3 Database in the SqliteDriver adapter that runMigrations expects. */
-function migrate(db: Database.Database): void {
-  runMigrations(new SqliteDriver(db));
+async function migrate(db: Database.Database): Promise<void> {
+  await runMigrations(new SqliteDriver(db));
 }
 
 // ---------------------------------------------------------------------------
@@ -29,11 +29,16 @@ function migrate(db: Database.Database): void {
 const DB_DIR = path.resolve(__dirname, '../../db');
 
 /** Return every *.sql filename under db/ in the same lexicographic order that
- *  runMigrations() uses so the test faithfully exercises production ordering. */
+ *  runMigrations() uses so the test faithfully exercises production ordering.
+ *  Includes _postgres.sql counterparts — runMigrations() applies every such
+ *  file too (converting it cross-driver rather than skipping it), tracking
+ *  each as its own row in `migrations`; see the "#885" describe block below
+ *  for the test that documents this explicitly. Excludes only .down.sql
+ *  files, which are applied by the separate down-migration path. */
 function discoverMigrationFiles(): string[] {
   return fs
     .readdirSync(DB_DIR)
-    .filter((f) => f.endsWith('.sql'))
+    .filter((f) => f.endsWith('.sql') && !f.endsWith('.down.sql'))
     .sort();
 }
 
@@ -72,9 +77,9 @@ describe('runMigrations — integration suite (#508)', () => {
   // all migrations for every schema assertion.
   let sharedDb: Database.Database;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     sharedDb = new Database(':memory:');
-    migrate(sharedDb);
+    await migrate(sharedDb);
   });
 
   afterAll(() => {
@@ -97,9 +102,9 @@ describe('runMigrations — integration suite (#508)', () => {
       expect(files).toEqual(sorted);
     });
 
-    it('all discovered migration files are recorded in the migrations table after a fresh run', () => {
+    it('all discovered migration files are recorded in the migrations table after a fresh run', async () => {
       const db = new Database(':memory:');
-      migrate(db);
+      await migrate(db);
 
       const appliedRows = db
         .prepare('SELECT id FROM migrations ORDER BY id')
@@ -124,15 +129,15 @@ describe('runMigrations — integration suite (#508)', () => {
   // -------------------------------------------------------------------------
 
   describe('clean application against a fresh empty database', () => {
-    it('runMigrations() completes without throwing on a brand-new in-memory DB', () => {
+    it('runMigrations() completes without throwing on a brand-new in-memory DB', async () => {
       const db = new Database(':memory:');
-      expect(() => migrate(db)).not.toThrow();
+      await expect(migrate(db)).resolves.not.toThrow();
       db.close();
     });
 
-    it('applies migrations in lexicographic filename order', () => {
+    it('applies migrations in lexicographic filename order', async () => {
       const db = new Database(':memory:');
-      migrate(db);
+      await migrate(db);
 
       const appliedRows = db
         .prepare('SELECT id, applied_at FROM migrations ORDER BY applied_at, id')
@@ -322,6 +327,27 @@ describe('runMigrations — integration suite (#508)', () => {
       });
     });
 
+    // --- 023_idempotency_request_fingerprint.sql ---
+    describe('023_idempotency_request_fingerprint.sql', () => {
+      it('adds the request_fingerprint column to idempotency_keys', () => {
+        expect(getColumns(sharedDb, 'idempotency_keys')).toContain('request_fingerprint');
+      });
+
+      it('records a fingerprint on claim and returns it from getIdempotencyRecord', async () => {
+        const db = new Database(':memory:');
+        await migrate(db);
+        db.prepare(
+          `INSERT INTO idempotency_keys (key, status_code, response, created_at, expires_at, status, request_fingerprint)
+           VALUES ('fp-key', 0, '', 1, 9999999999999, 'pending', 'wallet:player')`
+        ).run();
+        const row = db.prepare(
+          'SELECT request_fingerprint FROM idempotency_keys WHERE key = ?'
+        ).get('fp-key') as { request_fingerprint: string | null };
+        expect(row.request_fingerprint).toBe('wallet:player');
+        db.close();
+      });
+    });
+
     // --- 003_pending_pins.sql ---
     describe('003_pending_pins.sql', () => {
       it('creates the pending_pins table', () => {
@@ -335,6 +361,9 @@ describe('runMigrations — integration suite (#508)', () => {
         expect(cols).toContain('attempts');
         expect(cols).toContain('created_at');
         expect(cols).toContain('last_tried');
+        expect(cols).toContain('status');
+        expect(cols).toContain('expired_reason');
+        expect(cols).toContain('last_reconciled_at');
       });
     });
 
@@ -489,9 +518,9 @@ describe('runMigrations — integration suite (#508)', () => {
   // -------------------------------------------------------------------------
 
   describe('same-numeric-prefix migrations do not conflict', () => {
-    it('all four 002_* migrations apply cleanly together in a single fresh DB', () => {
+    it('all four 002_* migrations apply cleanly together in a single fresh DB', async () => {
       const db = new Database(':memory:');
-      expect(() => migrate(db)).not.toThrow();
+      await expect(migrate(db)).resolves.not.toThrow();
 
       const tables = getTables(db);
       expect(tables).toContain('validators');              // 002_validators
@@ -513,9 +542,9 @@ describe('runMigrations — integration suite (#508)', () => {
       db.close();
     });
 
-    it('all four 003_* migrations apply cleanly together without duplicate-table errors', () => {
+    it('all four 003_* migrations apply cleanly together without duplicate-table errors', async () => {
       const db = new Database(':memory:');
-      expect(() => migrate(db)).not.toThrow();
+      await expect(migrate(db)).resolves.not.toThrow();
 
       const tables = getTables(db);
       expect(tables).toContain('idempotency_keys');   // 003_idempotency_keys
@@ -537,9 +566,9 @@ describe('runMigrations — integration suite (#508)', () => {
       db.close();
     });
 
-    it('both 004_* migrations apply cleanly — 004_validators is a safe no-op', () => {
+    it('both 004_* migrations apply cleanly — 004_validators is a safe no-op', async () => {
       const db = new Database(':memory:');
-      expect(() => migrate(db)).not.toThrow();
+      await expect(migrate(db)).resolves.not.toThrow();
 
       const tables = getTables(db);
       expect(tables).toContain('revoked_tokens');  // 004_token_revocation
@@ -559,9 +588,9 @@ describe('runMigrations — integration suite (#508)', () => {
       db.close();
     });
 
-    it('subscriptions table is created exactly once despite two 003_* files defining it', () => {
+    it('subscriptions table is created exactly once despite two 003_* files defining it', async () => {
       const db = new Database(':memory:');
-      migrate(db);
+      await migrate(db);
 
       // If a duplicate CREATE TABLE (without IF NOT EXISTS) had been executed,
       // the migration would have thrown and the table would be missing or the
@@ -577,9 +606,9 @@ describe('runMigrations — integration suite (#508)', () => {
       db.close();
     });
 
-    it('validators table is created exactly once despite 002_validators.sql and 004_validators.sql both defining it', () => {
+    it('validators table is created exactly once despite 002_validators.sql and 004_validators.sql both defining it', async () => {
       const db = new Database(':memory:');
-      migrate(db);
+      await migrate(db);
 
       const rows = db
         .prepare(
@@ -597,11 +626,11 @@ describe('runMigrations — integration suite (#508)', () => {
   // -------------------------------------------------------------------------
 
   describe('idempotency', () => {
-    it('running migrations twice applies each file exactly once', () => {
+    it('running migrations twice applies each file exactly once', async () => {
       const db = new Database(':memory:');
 
-      migrate(db);
-      migrate(db);
+      await migrate(db);
+      await migrate(db);
 
       const rows = db
         .prepare('SELECT id FROM migrations')
@@ -620,14 +649,14 @@ describe('runMigrations — integration suite (#508)', () => {
       db.close();
     });
 
-    it('running migrations three times produces no duplicate rows and no errors', () => {
+    it('running migrations three times produces no duplicate rows and no errors', async () => {
       const db = new Database(':memory:');
 
-      expect(() => {
-        migrate(db);
-        migrate(db);
-        migrate(db);
-      }).not.toThrow();
+      await expect((async () => {
+        await migrate(db);
+        await migrate(db);
+        await migrate(db);
+      })()).resolves.not.toThrow();
 
       const rows = db
         .prepare('SELECT id FROM migrations')
@@ -682,9 +711,9 @@ describe('runMigrations — integration suite (#508)', () => {
 describe('full migration sequence from scratch (#885)', () => {
   let db: Database.Database;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     db = new Database(':memory:');
-    migrate(db);
+    await migrate(db);
   });
 
   afterAll(() => {
@@ -709,9 +738,9 @@ describe('full migration sequence from scratch (#885)', () => {
 
   // ── 1. No errors on a fresh in-memory DB ───────────────────────────────────
 
-  it('runMigrations() completes without throwing on a fresh in-memory DB', () => {
+  it('runMigrations() completes without throwing on a fresh in-memory DB', async () => {
     const freshDb = new Database(':memory:');
-    expect(() => migrate(freshDb)).not.toThrow();
+    await expect(migrate(freshDb)).resolves.not.toThrow();
     freshDb.close();
   });
 
@@ -756,6 +785,35 @@ describe('full migration sequence from scratch (#885)', () => {
     expect(cols).toContain('revoked_at');
   });
 
+  it("api_keys table has the lookup_hash column added by migration 024_api_key_lookup_hash (#1033)", () => {
+    expect(columns('api_keys')).toContain('lookup_hash');
+  });
+
+  it("migration 024 creates the api_keys lookup indexes on both driver variants", () => {
+    // Both 024_api_key_lookup_hash.sql and its _postgres twin are applied
+    // (runMigrations converts cross-driver rather than skipping), and the pair
+    // must be idempotent — the second must not fail or duplicate the indexes.
+    const indexNames = (
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'api_keys'",
+        )
+        .all() as { name: string }[]
+    ).map((r) => r.name);
+
+    expect(indexNames).toContain('idx_api_keys_lookup_hash');
+    expect(indexNames).toContain('idx_api_keys_lookup_pending');
+    expect(indexNames.filter((n) => n === 'idx_api_keys_lookup_hash')).toHaveLength(1);
+
+    const applied = (
+      db.prepare("SELECT id FROM migrations WHERE id LIKE '024_%'").all() as { id: string }[]
+    ).map((r) => r.id);
+    expect(applied.sort()).toEqual([
+      '024_api_key_lookup_hash.sql',
+      '024_api_key_lookup_hash_postgres.sql',
+    ]);
+  });
+
   it("webhook_subscriptions table has expected columns from migration 012_webhook_subscriptions", () => {
     const cols = columns('webhook_subscriptions');
     expect(cols).toContain('id');
@@ -790,10 +848,12 @@ describe('full migration sequence from scratch (#885)', () => {
       .all() as { id: string }[];
     const appliedIds = new Set(appliedRows.map((r) => r.id));
 
-    // runMigrations skips _postgres files — match its filter exactly
+    // runMigrations() applies every *.sql file under db/ (including _postgres
+    // variants — it converts them cross-driver rather than skipping them), so
+    // match its filter exactly. Same filter as discoverMigrationFiles() above.
     const expectedFiles = fs
       .readdirSync(path.resolve(__dirname, '../../db'))
-      .filter((f) => f.endsWith('.sql') && !f.includes('_postgres'))
+      .filter((f) => f.endsWith('.sql') && !f.endsWith('.down.sql'))
       .sort();
 
     for (const file of expectedFiles) {

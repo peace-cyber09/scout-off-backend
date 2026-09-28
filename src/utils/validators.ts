@@ -1,3 +1,5 @@
+import { isIP } from 'net';
+
 /**
  * src/utils/validators.ts
  *
@@ -16,3 +18,17 @@
  *   STELLAR_ADDRESS_RE.test('notakey') // false
  */
 export const STELLAR_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
+
+/**
+ * Returns true if ip is a syntactically valid IPv4 or IPv6 address.
+ * Backed by Node's built-in net.isIP(), which returns 0 for anything
+ * that isn't a valid IPv4 or IPv6 address (including non-string input).
+ *
+ * @example
+ *   isValidIpAddress('203.0.113.5') // true
+ *   isValidIpAddress('::1') // true
+ *   isValidIpAddress('not-an-ip') // false
+ */
+export function isValidIpAddress(ip: string): boolean {
+  return typeof ip === 'string' && isIP(ip) !== 0;
+}

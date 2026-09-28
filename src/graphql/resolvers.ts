@@ -12,6 +12,7 @@
  */
 
 import { GraphQLError } from 'graphql';
+import config from '../config';
 import {
   getPlayerById,
   queryPlayers,
@@ -20,6 +21,9 @@ import {
   type PlayerRow,
 } from '../db';
 import { getTierMeta, tierName } from '../utils/tier';
+import { canAccessPlayer } from '../utils/playerAccess';
+import { hasApiKeyScope } from '../utils/apiKeyScopes';
+import { MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE } from '../utils/pagination';
 import { type GraphQLContext } from './context';
 
 // ─── Auth helpers ──────────────────────────────────────────────────────────────
@@ -37,6 +41,36 @@ function assertRole(ctx: GraphQLContext, role: string): void {
   if (ctx.role !== role) {
     throw new GraphQLError(`Requires ${role} role`, {
       extensions: { code: 'UNAUTHORIZED' },
+    });
+  }
+}
+
+/**
+ * Enforce the shared API-key scope contract (#1019).
+ *
+ * Only applies when the request was authenticated with an API key that
+ * carries an explicit (restricted) scope list. JWT/legacy-key requests
+ * (`apiKeyScopes === undefined/null`) always pass — identical semantics to
+ * the REST requireApiKeyScope middleware.
+ */
+function assertApiKeyScope(ctx: GraphQLContext, scope: string): void {
+  if (ctx.apiKeyScopes === undefined || ctx.apiKeyScopes === null) return;
+  if (!hasApiKeyScope(ctx.apiKeyScopes, scope)) {
+    throw new GraphQLError(`Missing required API key scope: ${scope}`, {
+      extensions: { code: 'UNAUTHORIZED', requiredScope: scope },
+    });
+  }
+}
+
+/**
+ * Shared milestone-access gate (same decision as REST getPlayerMilestones).
+ * Throws a NOT_FOUND error when the player is hidden from the caller,
+ * mirroring the REST 404 response for deactivated players.
+ */
+function assertPlayerMilestonesAccess(ctx: GraphQLContext, row: PlayerRow): void {
+  if (!canAccessPlayer(row, { account: ctx.account, role: ctx.role })) {
+    throw new GraphQLError('Player not found', {
+      extensions: { code: 'NOT_FOUND' },
     });
   }
 }
@@ -66,14 +100,15 @@ const Query = {
   /**
    * player(id: ID!): Player
    *
-   * Returns null for deactivated players (consistent with REST GET /players/:id).
-   * Public — no auth required.
+   * Returns null for deactivated players for unauthorized callers (same
+   * access decision as REST GET /players/:id via src/utils/playerAccess.ts).
+   * Owner/admin callers can still fetch deactivated players, exactly like REST.
+   * Public — no auth required for active players.
    */
-  player(_parent: unknown, args: { id: string }, _ctx: GraphQLContext) {
-    const row = getPlayerById(args.id);
+  async player(_parent: unknown, args: { id: string }, ctx: GraphQLContext) {
+    const row = await getPlayerById(args.id);
     if (!row) return null;
-    // Hide deactivated players from non-owner, non-admin callers
-    if (row.is_active === 0) return null;
+    if (!canAccessPlayer(row, { account: ctx.account, role: ctx.role })) return null;
     return serializePlayer(row);
   },
 
@@ -82,7 +117,7 @@ const Query = {
    *
    * Mirrors GET /api/players filter endpoint.  Public — no auth required.
    */
-  players(
+  async players(
     _parent: unknown,
     args: {
       region?: string | null;
@@ -94,7 +129,7 @@ const Query = {
     _ctx: GraphQLContext,
   ) {
     const page = Math.max(1, args.page ?? 1);
-    const pageSize = Math.min(100, Math.max(1, args.pageSize ?? 20));
+    const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, args.pageSize ?? DEFAULT_PAGE_SIZE));
     const offset = (page - 1) * pageSize;
 
     const opts = {
@@ -103,8 +138,8 @@ const Query = {
       minTier: args.minTier ?? undefined,
     };
 
-    const rows = queryPlayers({ ...opts, limit: pageSize, offset });
-    const total = countPlayers(opts);
+    const rows = await queryPlayers({ ...opts, limit: pageSize, offset });
+    const total = await countPlayers(opts);
     const pages = Math.ceil(total / pageSize);
 
     return {
@@ -116,7 +151,10 @@ const Query = {
   /**
    * milestones(playerId: ID!): [Milestone!]!
    *
-   * Returns combined indexed + on-chain milestones.  Public — no auth required.
+   * Returns combined indexed + on-chain milestones. Public for active
+   * players; deactivated players follow the shared access decision
+   * (owner/admin only) — identical to REST getPlayerMilestones (#1019).
+   * API-key authenticated requests must carry the read:milestones scope.
    * Uses DataLoader under the hood when called as a root query too.
    */
   async milestones(
@@ -124,12 +162,14 @@ const Query = {
     args: { playerId: string },
     ctx: GraphQLContext,
   ) {
-    const player = getPlayerById(args.playerId);
+    assertApiKeyScope(ctx, 'read:milestones');
+    const player = await getPlayerById(args.playerId);
     if (!player) {
       throw new GraphQLError('Player not found', {
         extensions: { code: 'NOT_FOUND' },
       });
     }
+    assertPlayerMilestonesAccess(ctx, player);
     return ctx.loaders.milestones.load(args.playerId);
   },
 
@@ -140,19 +180,22 @@ const Query = {
    * Requires authentication; scout can only query their own wallet,
    * admins can query any wallet.
    */
-  scoutSubscription(
+  async scoutSubscription(
     _parent: unknown,
     args: { wallet: string },
     ctx: GraphQLContext,
   ) {
     assertAuthenticated(ctx);
+    // Restricted API keys need the read:subscription scope (REST's
+    // GET /scouts/:wallet/subscription enforces the same scope).
+    assertApiKeyScope(ctx, 'read:subscription');
     if (ctx.role !== 'admin' && ctx.account !== args.wallet) {
       throw new GraphQLError('You can only query your own subscription', {
         extensions: { code: 'UNAUTHORIZED' },
       });
     }
 
-    const sub = getLatestSubscription(args.wallet);
+    const sub = await getLatestSubscription(args.wallet);
     const now = Math.floor(Date.now() / 1000);
 
     if (!sub) {
@@ -165,7 +208,7 @@ const Query = {
       };
     }
 
-    const gracePeriodSecs = (24 + 0) * 3600; // mirrors config.subscriptionGracePeriodHours
+    const gracePeriodSecs = config.subscriptionGracePeriodHours * 3600;
     const inGrace = now > sub.expires_at && now <= sub.expires_at + gracePeriodSecs;
     const active = sub.expires_at > now || inGrace;
     const remainingDays = Math.max(0, Math.ceil((sub.expires_at - now) / 86400));
@@ -184,14 +227,23 @@ const Query = {
 
 const Player = {
   /**
-   * Player.milestones — uses DataLoader so a list of players batches all
+   * Player.milestones — uses DataLoader so a single fetch batches all
    * milestone lookups into a single DB+RPC round-trip.
+   *
+   * Applies the same shared access decision as REST (via
+   * src/utils/playerAccess.ts): when the parent player is deactivated and
+   * the caller is neither owner nor admin, the field resolves to an empty
+   * list — no milestone data is revealed. Active players are unaffected.
    */
   async milestones(
-    parent: { player_id: string },
+    parent: { player_id: string; wallet: string; is_active?: number | null },
     _args: unknown,
     ctx: GraphQLContext,
   ) {
+    assertApiKeyScope(ctx, 'read:milestones');
+    if (!canAccessPlayer(parent, { account: ctx.account, role: ctx.role })) {
+      return [];
+    }
     return ctx.loaders.milestones.load(parent.player_id);
   },
 };

@@ -10,10 +10,11 @@ jest.unmock('better-sqlite3');
 
 import Database from 'better-sqlite3';
 import { runMigrations } from '../../src/db/migrate';
+import { SqliteDriver } from '../../src/db/sqlite-driver';
 
 let db: Database.Database;
 
-beforeEach(() => {
+beforeEach(async () => {
   db = new Database(':memory:');
   db.exec(`
     CREATE TABLE IF NOT EXISTS events (
@@ -65,7 +66,11 @@ beforeEach(() => {
     );
     CREATE INDEX IF NOT EXISTS idx_contact_unlocks_scout ON contact_unlocks (scout_wallet);
   `);
-  runMigrations(db);
+  // runMigrations() expects the DbDriver abstraction (with .all()/.exec()/
+  // .run()/.transaction()), not a raw better-sqlite3 Database instance —
+  // wrap it the same way tests/db/migrate.test.ts and
+  // tests/db/compositeIndex.test.ts do.
+  await runMigrations(new SqliteDriver(db));
 });
 
 afterEach(() => {
@@ -229,9 +234,9 @@ describe('Migration runner (real DB)', () => {
     }
   });
 
-  it('is idempotent — running migrations twice does not error or duplicate', () => {
+  it('is idempotent — running migrations twice does not error or duplicate', async () => {
     const before = db.prepare('SELECT COUNT(*) as count FROM migrations').get() as any;
-    expect(() => runMigrations(db)).not.toThrow();
+    await expect(runMigrations(new SqliteDriver(db))).resolves.not.toThrow();
     const after = db.prepare('SELECT COUNT(*) as count FROM migrations').get() as any;
     expect(after.count).toBe(before.count);
   });

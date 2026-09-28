@@ -8,8 +8,8 @@
  * player-filter endpoint (region, position, minTier — pagination fields are
  * excluded because they are not meaningful for a stored preset).
  *
- * Ownership is enforced inline via assertWalletOwnership(), consistent with
- * the bookmarks and notes controllers.
+ * Ownership of the :wallet path parameter is enforced by the shared
+ * requireWalletOwner() middleware at the route level (see src/routes/scout.ts).
  */
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
@@ -17,10 +17,15 @@ import {
   insertSavedSearch,
   getSavedSearchesByScout,
   deleteSavedSearch,
+  getSavedSearchById,
+  updateSavedSearch,
+  countSavedSearchesByScout,
+  queryPlayers,
+  countPlayers,
+  type SavedSearchRow,
 } from '../db';
-import { isValidStellarAddress } from '../utils/stellarAddress';
-import { sendForbidden } from '../utils/authError';
 import { logger } from '../utils/logger';
+import { MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE } from '../utils/pagination';
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 
@@ -47,24 +52,19 @@ export const createSavedSearchSchema = z.object({
     .min(1, 'name is required')
     .max(100, 'name must be 100 characters or fewer'),
   filters: savedSearchFilterSchema,
-});
+}).strict();
 
 export type CreateSavedSearchRequest = z.infer<typeof createSavedSearchSchema>;
 
-// ─── Ownership guard ──────────────────────────────────────────────────────────
+/**
+ * Schema for the PUT body: optional name and/or filters.
+ */
+export const updateSavedSearchSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  filters: savedSearchFilterSchema.optional(),
+}).strict();
 
-function assertWalletOwnership(req: Request, res: Response): boolean {
-  const { wallet } = req.params;
-  if (!isValidStellarAddress(wallet)) {
-    res.status(400).json({ success: false, error: 'Invalid Stellar address' });
-    return false;
-  }
-  if (req.account !== wallet) {
-    sendForbidden(res, 'Forbidden: wallet mismatch');
-    return false;
-  }
-  return true;
-}
+export type UpdateSavedSearchRequest = z.infer<typeof updateSavedSearchSchema>;
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -86,44 +86,50 @@ export async function createSavedSearch(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
-  try {
-    if (!assertWalletOwnership(req, res)) return;
-
-    const parsed = createSavedSearchSchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({
-        success: false,
-        error: parsed.error.errors[0]?.message ?? 'Invalid request body',
-      });
-      return;
-    }
-
-    const { name, filters } = parsed.data;
-    const now = Math.floor(Date.now() / 1000);
-    const filtersJson = JSON.stringify(filters);
-
-    const id = insertSavedSearch({
-      scout_wallet: req.params.wallet,
-      name,
-      filters: filtersJson,
-      created_at: now,
+  const parsed = createSavedSearchSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      error: parsed.error.errors[0]?.message ?? 'Invalid request body',
     });
-
-    logger.info({ scout: req.params.wallet, id, name, action: 'saved_search_created' });
-
-    res.status(201).json({
-      success: true,
-      data: {
-        id,
-        scout_wallet: req.params.wallet,
-        name,
-        filters,
-        created_at: now,
-      },
-    });
-  } catch (err) {
-    next(err);
+    return;
   }
+
+  const { name, filters } = parsed.data;
+  const wallet = req.params.wallet as string;
+
+  // Enforce 20 saved searches limit
+  const currentCount = await countSavedSearchesByScout(wallet);
+  if (currentCount >= 20) {
+    res.status(422).json({
+      success: false,
+      error: 'Maximum of 20 saved searches per scout',
+    });
+    return;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const filtersJson = JSON.stringify(filters);
+
+  const id = await insertSavedSearch({
+    scout_wallet: wallet,
+    name,
+    filters: filtersJson,
+    created_at: now,
+  });
+
+  logger.info({ scout: wallet, id, name, action: 'saved_search_created' });
+
+  res.status(201).json({
+    success: true,
+    data: {
+      id,
+      scout_wallet: wallet,
+      name,
+      filters,
+      created_at: now,
+    },
+  });
 }
 
 /**
@@ -142,23 +148,17 @@ export async function listSavedSearches(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
-  try {
-    if (!assertWalletOwnership(req, res)) return;
+  const rows = await getSavedSearchesByScout(req.params.wallet as string);
 
-    const rows = getSavedSearchesByScout(req.params.wallet);
+  const data = rows.map((row) => ({
+    id:           row.id,
+    scout_wallet: row.scout_wallet,
+    name:         row.name,
+    filters:      JSON.parse(row.filters) as SavedSearchFilters,
+    created_at:   row.created_at,
+  }));
 
-    const data = rows.map((row) => ({
-      id:           row.id,
-      scout_wallet: row.scout_wallet,
-      name:         row.name,
-      filters:      JSON.parse(row.filters) as SavedSearchFilters,
-      created_at:   row.created_at,
-    }));
-
-    res.json({ success: true, data });
-  } catch (err) {
-    next(err);
-  }
+  res.json({ success: true, data });
 }
 
 /**
@@ -180,25 +180,159 @@ export async function deleteSavedSearchHandler(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
-  try {
-    if (!assertWalletOwnership(req, res)) return;
-
-    const id = parseInt(req.params.id, 10);
-    if (isNaN(id)) {
-      res.status(400).json({ success: false, error: 'Invalid saved search id' });
-      return;
-    }
-
-    const removed = deleteSavedSearch(id, req.params.wallet);
-    if (!removed) {
-      res.status(404).json({ success: false, error: 'Saved search not found' });
-      return;
-    }
-
-    logger.info({ scout: req.params.wallet, id, action: 'saved_search_deleted' });
-
-    res.json({ success: true, data: { removed: true, id } });
-  } catch (err) {
-    next(err);
+  const id = parseInt(req.params.id as string, 10);
+  if (isNaN(id)) {
+    res.status(400).json({ success: false, error: 'Invalid saved search id' });
+    return;
   }
+
+  const removed = await deleteSavedSearch(id, req.params.wallet as string);
+  if (!removed) {
+    res.status(404).json({ success: false, error: 'Saved search not found' });
+    return;
+  }
+
+  logger.info({ scout: req.params.wallet as string, id, action: 'saved_search_deleted' });
+
+  res.json({ success: true, data: { removed: true, id } });
+}
+
+/**
+ * PUT /api/scouts/:wallet/saved-searches/:id
+ *
+ * Update a saved search's name and/or filters.
+ * Returns 404 when no matching saved search is found for this scout.
+ *
+ * @param id  {number} - Row id of the saved search to update
+ * @body { name?: string, filters?: { region?, position?, minTier? } }
+ * @response 200 { success: true, data: { id, scout_wallet, name, filters, created_at } }
+ * @response 400 Invalid request body
+ * @response 403 Wallet mismatch or not the scout role
+ * @response 404 Saved search not found
+ * @auth Bearer (scout role required; wallet must match authenticated account)
+ */
+export async function updateSavedSearchHandler(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const id = parseInt(req.params.id as string, 10);
+  if (isNaN(id)) {
+    res.status(400).json({ success: false, error: 'Invalid saved search id' });
+    return;
+  }
+
+  const parsed = updateSavedSearchSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      error: parsed.error.errors[0]?.message ?? 'Invalid request body',
+    });
+    return;
+  }
+
+  const { name, filters } = parsed.data;
+  const wallet = req.params.wallet as string;
+
+  // Build updates object
+  const updates: { name?: string; filters?: string } = {};
+  if (name !== undefined) {
+    updates.name = name;
+  }
+  if (filters !== undefined) {
+    updates.filters = JSON.stringify(filters);
+  }
+
+  const updated = await updateSavedSearch(id, wallet, updates);
+  if (!updated) {
+    res.status(404).json({ success: false, error: 'Saved search not found' });
+    return;
+  }
+
+  // Fetch the updated row to return
+  const row = await getSavedSearchById(id, wallet);
+  if (!row) {
+    res.status(404).json({ success: false, error: 'Saved search not found' });
+    return;
+  }
+
+  logger.info({ scout: wallet, id, action: 'saved_search_updated' });
+
+  res.json({
+    success: true,
+    data: {
+      id: row.id,
+      scout_wallet: row.scout_wallet,
+      name: row.name,
+      filters: JSON.parse(row.filters) as SavedSearchFilters,
+      created_at: row.created_at,
+    },
+  });
+}
+
+/**
+ * GET /api/scouts/:wallet/saved-searches/:id/run
+ *
+ * Execute a saved search and return matching players (paginated).
+ * Returns 404 when the saved search does not exist for this scout.
+ *
+ * @param id  {number} - Row id of the saved search to run
+ * @query page {number} - Page number (default 1)
+ * @query pageSize {number} - Page size (default 20, max 100)
+ * @response 200 { success: true, data: { players: PlayerRow[], total: number, page: number, pageSize: number } }
+ * @response 403 Wallet mismatch or not the scout role
+ * @response 404 Saved search not found
+ * @auth Bearer (scout role required; wallet must match authenticated account)
+ */
+export async function runSavedSearch(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const id = parseInt(req.params.id as string, 10);
+  if (isNaN(id)) {
+    res.status(400).json({ success: false, error: 'Invalid saved search id' });
+    return;
+  }
+
+  const wallet = req.params.wallet as string;
+  const row = await getSavedSearchById(id, wallet);
+  if (!row) {
+    res.status(404).json({ success: false, error: 'Saved search not found' });
+    return;
+  }
+
+  // Parse filters from saved search
+  const filters = JSON.parse(row.filters) as SavedSearchFilters;
+
+  // Parse pagination params
+  const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+  const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(req.query.pageSize as string, 10) || DEFAULT_PAGE_SIZE));
+  const offset = (page - 1) * pageSize;
+
+  // Query players with the saved filters
+  const players = await queryPlayers({
+    region: filters.region,
+    position: filters.position,
+    minTier: filters.minTier,
+    limit: pageSize,
+    offset,
+  });
+
+  // Get total count for pagination
+  const total = await countPlayers({
+    region: filters.region,
+    position: filters.position,
+    minTier: filters.minTier,
+  });
+
+  res.json({
+    success: true,
+    data: {
+      players,
+      total,
+      page,
+      pageSize,
+    },
+  });
 }

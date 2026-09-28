@@ -6,13 +6,26 @@ import config from "./config";
 import { logger } from "./utils/logger";
 import { initDb, closeDb } from "./db";
 import { stellarHealth } from "./services/stellar";
-import { checkHealth, retryPendingPins } from "./services/ipfs";
+import { checkHealth, retryPendingPins, reconcilePendingPins } from "./services/ipfs";
 import { indexEvents } from "./services/indexer";
 import { fetchLastIndexedLedger, persistLastIndexedLedger } from "./db";
 import { initBlocklist } from "./services/tokenBlocklist";
+import { startDecayTimer } from "./services/ipReputation";
+import {
+  initCacheInvalidationSubscriber,
+  closeCacheInvalidationSubscriber,
+} from "./services/cache";
+import { closeRedisClients } from "./services/redis";
+import { runTierDivergenceCheck } from "./services/tierDivergenceJob";
+import { getTierDivergenceTotal } from "./services/tierDivergenceJob";
+import { setTierDivergenceGetter } from "./middleware/metrics";
 
 // Database initialization is now async - must be awaited
 async function start() {
+  // Register the tier-divergence counter getter so the metrics endpoint can
+  // expose scout_off_tier_divergence_total without a circular import (#1132).
+  setTierDivergenceGetter(getTierDivergenceTotal);
+
   try {
     await initDb();
   } catch (err) {
@@ -23,6 +36,13 @@ async function start() {
   // Initialise the token revocation blocklist (prune expired rows, schedule
   // background pruning, and kick off a non-blocking Redis warm-up sync).
   initBlocklist();
+
+  // Start the IP-reputation decay timer (not started as an import side effect).
+  startDecayTimer();
+
+  // Listen for cross-instance player-list cache invalidations on the Redis
+  // pub/sub channel `invalidate:players` (no-op when REDIS_URL is unset).
+  await initCacheInvalidationSubscriber();
 
   // If INDEXER_BACKFILL_FROM_LEDGER is set and is less than the stored last_ledger,
   // reset last_ledger so the next poll replays from that point.
@@ -96,6 +116,32 @@ async function startServer() {
 
   const retryInterval = setInterval(retryPins, 30_000);
 
+  // Scheduled reconciliation of pending pins against Pinata & IPFS gateways
+  const reconcilePins = async () => {
+    try {
+      await reconcilePendingPins();
+    } catch (err) {
+      logger.error("IPFS reconcile worker error:", (err as Error).message);
+    }
+  };
+
+  reconcilePins();
+  const reconcileInterval = setInterval(reconcilePins, config.ipfsReconcileIntervalMs);
+
+  // Scheduled tier divergence check (#1132): compare derived (off-chain) tier
+  // against stored progress_level; emits scout_off_tier_divergence_total metric
+  // and structured log per mismatch. Interval configurable via TIER_DIVERGENCE_INTERVAL_MS.
+  const runDivergenceCheck = async () => {
+    try {
+      await runTierDivergenceCheck();
+    } catch (err) {
+      logger.error("Tier divergence check error:", (err as Error).message);
+    }
+  };
+
+  runDivergenceCheck();
+  const divergenceInterval = setInterval(runDivergenceCheck, config.tierDivergence.intervalMs);
+
   const SHUTDOWN_TIMEOUT_MS = 10_000;
   let isShuttingDown = false;
 
@@ -114,6 +160,8 @@ async function startServer() {
 
     clearInterval(pollInterval);
     clearInterval(retryInterval);
+    clearInterval(reconcileInterval);
+    clearInterval(divergenceInterval);
 
     server.close(async (err) => {
       if (err) {
@@ -127,6 +175,14 @@ async function startServer() {
         logger.info("Database connection closed");
       } catch (dbErr) {
         logger.error("Error closing database:", dbErr);
+      }
+
+      try {
+        await closeCacheInvalidationSubscriber();
+        await closeRedisClients();
+        logger.info("Redis connections closed");
+      } catch (redisErr) {
+        logger.error("Error closing Redis connections:", redisErr);
       }
 
       try {

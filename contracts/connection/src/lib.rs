@@ -5,7 +5,7 @@ use soroban_sdk::{
 };
 use scout_off_shared::{
     errors::Error,
-    storage::{bump_instance, is_initialized, is_paused, set_initialized},
+    storage::{bump_instance, is_initialized, is_paused, set_initialized, set_paused},
 };
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,62 @@ impl ConnectionContract {
             .instance()
             .set(&DataKey::SubscriptionContract, &subscription_contract);
         set_initialized(&env);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    // ── Pause / Unpause ────────────────────────────────────────────────────
+
+    /// Pause the contract, preventing all state-changing operations.
+    ///
+    /// Only the admin address set during [`initialize`] may call this function.
+    /// The guard is already wired into [`create_connection`], [`close_connection`],
+    /// and [`log_trial_offer`] via [`is_paused`].  If the contract is already
+    /// paused the call is a no-op (returns `Ok`).
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`] — Contract has not been initialized.
+    /// * [`Error::Unauthorized`] — Caller is not the admin.
+    pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
+        if !is_initialized(&env) {
+            return Err(Error::NotInitialized);
+        }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        set_paused(&env, true);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Unpause the contract, re-enabling all state-changing operations.
+    ///
+    /// Only the admin address may call this.  If the contract is not currently
+    /// paused the call is a no-op (returns `Ok`).
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`] — Contract has not been initialized.
+    /// * [`Error::Unauthorized`] — Caller is not the admin.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
+        if !is_initialized(&env) {
+            return Err(Error::NotInitialized);
+        }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        set_paused(&env, false);
         bump_instance(&env);
         Ok(())
     }
@@ -700,6 +756,48 @@ mod tests {
             &admin, &Address::generate(&env), &Address::generate(&env),
         );
         assert!(result.is_err());
+    }
+
+    // ── pause / unpause ──────────────────────────────────────────────────────
+
+    #[test]
+    fn pause_blocks_create_connection() {
+        let env = Env::default();
+        let (conn, reg, sub, admin, token) = setup(&env);
+        let (_, player_id) = register_player(&env, &reg);
+        let scout = Address::generate(&env);
+        fund(&env, &token, &scout);
+        sub.subscribe(&scout, &1u32, &1000u32);
+        // Pause the connection contract.
+        assert!(conn.try_pause(&admin).is_ok());
+        let result = conn.try_create_connection(
+            &scout, &player_id, &String::from_str(&env, "direct"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unpause_restores_create_connection() {
+        let env = Env::default();
+        let (conn, reg, sub, admin, token) = setup(&env);
+        let (_, player_id) = register_player(&env, &reg);
+        let scout = Address::generate(&env);
+        fund(&env, &token, &scout);
+        sub.subscribe(&scout, &1u32, &1000u32);
+        conn.pause(&admin);
+        conn.unpause(&admin);
+        let result = conn.try_create_connection(
+            &scout, &player_id, &String::from_str(&env, "direct"),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn non_admin_cannot_pause_connection() {
+        let env = Env::default();
+        let (conn, _reg, _sub, _admin, _token) = setup(&env);
+        let non_admin = Address::generate(&env);
+        assert!(conn.try_pause(&non_admin).is_err());
     }
 
     #[test]

@@ -19,6 +19,8 @@ const SECRET = process.env.JWT_SECRET ?? 'test-secret';
 jest.mock('../../src/db', () => ({
   // existing mocks required by scout router
   queryEvents: jest.fn(),
+  getEventsPage: jest.fn().mockReturnValue([]),
+  countEventsFiltered: jest.fn().mockReturnValue(0),
   getPlayerById: jest.fn(),
   getLatestSubscription: jest.fn().mockReturnValue(null),
   insertSubscription: jest.fn(),
@@ -27,20 +29,27 @@ jest.mock('../../src/db', () => ({
   insertContactUnlock: jest.fn(),
   getContactUnlocksByScout: jest.fn().mockReturnValue([]),
   hasContactUnlock: jest.fn().mockReturnValue(false),
-  // notes helpers
+  // notes helpers (legacy upsert)
   upsertScoutNote: jest.fn(),
   getScoutNote: jest.fn(),
   getScoutNotes: jest.fn(),
+  // notes helpers (multi-note CRUD)
+  insertScoutPlayerNote: jest.fn(),
+  getScoutPlayerNotes: jest.fn(),
+  updateScoutPlayerNote: jest.fn(),
+  deleteScoutPlayerNote: jest.fn(),
   // api key helpers (needed by scout router import)
   insertApiKey: jest.fn(),
   listApiKeysByWallet: jest.fn().mockReturnValue([]),
   revokeApiKeyById: jest.fn(),
   getApiKeyByHash: jest.fn().mockReturnValue(null),
-  touchApiKeyLastUsed: jest.fn(),
+  touchApiKeyLastUsed: jest.fn().mockResolvedValue(undefined),
   // bookmarks helpers (needed by scout router import)
   insertBookmark: jest.fn(),
   deleteBookmark: jest.fn(),
   getBookmarksByScout: jest.fn().mockReturnValue([]),
+  // events export (needed by GET /api/admin/events/export)
+  getEventsIterable: jest.fn(function* () {}),
 }));
 
 jest.mock('../../src/services/stellar', () => ({
@@ -66,11 +75,19 @@ import {
   upsertScoutNote,
   getScoutNote,
   getScoutNotes,
+  insertScoutPlayerNote,
+  getScoutPlayerNotes,
+  updateScoutPlayerNote,
+  deleteScoutPlayerNote,
 } from '../../src/db';
 
 const mockUpsertScoutNote = upsertScoutNote as jest.Mock;
 const mockGetScoutNote = getScoutNote as jest.Mock;
 const mockGetScoutNotes = getScoutNotes as jest.Mock;
+const mockInsertScoutPlayerNote = insertScoutPlayerNote as jest.Mock;
+const mockGetScoutPlayerNotes = getScoutPlayerNotes as jest.Mock;
+const mockUpdateScoutPlayerNote = updateScoutPlayerNote as jest.Mock;
+const mockDeleteScoutPlayerNote = deleteScoutPlayerNote as jest.Mock;
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -326,5 +343,382 @@ describe('Admin endpoints must not expose scout notes', () => {
     const bodyStr = typeof res.text === 'string' ? res.text : JSON.stringify(res.body);
     expect(bodyStr).not.toContain('note_text');
     expect(bodyStr).not.toContain('scout_player_notes');
+  });
+});
+
+// ─── POST /api/scouts/:wallet/players/:playerId/notes ─────────────────────────
+
+describe('POST /api/scouts/:wallet/players/:playerId/notes', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('creates a note and returns 201', async () => {
+    mockInsertScoutPlayerNote.mockReturnValueOnce(42);
+
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: 'Impressive left foot' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.id).toBe(42);
+    expect(res.body.data.content).toBe('Impressive left foot');
+    expect(res.body.data.player_id).toBe(PLAYER_ID);
+    expect(res.body.data.scout_wallet).toBe(SCOUT_A);
+    expect(mockInsertScoutPlayerNote).toHaveBeenCalledTimes(1);
+  });
+
+  it('sanitizes HTML before storing', async () => {
+    mockInsertScoutPlayerNote.mockReturnValueOnce(1);
+
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: '<script>alert(1)</script>Follow up' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.content).not.toContain('<script>');
+    expect(res.body.data.content).not.toContain('</script>');
+  });
+
+  it('strips control characters before storing', async () => {
+    mockInsertScoutPlayerNote.mockReturnValueOnce(1);
+
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: 'Fast player\x00\x1f' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.content).not.toContain('\x00');
+  });
+
+  it('returns 400 when content is empty', async () => {
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: '' });
+
+    expect(res.status).toBe(400);
+    expect(mockInsertScoutPlayerNote).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when content field is missing', async () => {
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(mockInsertScoutPlayerNote).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when content exceeds 2000 characters', async () => {
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: 'a'.repeat(2001) });
+
+    expect(res.status).toBe(400);
+    expect(mockInsertScoutPlayerNote).not.toHaveBeenCalled();
+  });
+
+  it('accepts content of exactly 2000 characters', async () => {
+    mockInsertScoutPlayerNote.mockReturnValueOnce(1);
+
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: 'a'.repeat(2000) });
+
+    expect(res.status).toBe(201);
+  });
+
+  it('returns 403 when scout tries to post under a different wallet', async () => {
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_B}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: 'Should not be stored' });
+
+    expect(res.status).toBe(403);
+    expect(mockInsertScoutPlayerNote).not.toHaveBeenCalled();
+  });
+
+  it('returns 401 when no token is provided', async () => {
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .send({ content: 'No auth' });
+
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 403 when a player token is used', async () => {
+    const res = await request(app)
+      .post(`/api/scouts/${PLAYER}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${playerToken}`)
+      .send({ content: 'Wrong role' });
+
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─── GET /api/scouts/:wallet/players/:playerId/notes ──────────────────────────
+
+describe('GET /api/scouts/:wallet/players/:playerId/notes', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('returns all notes for the scout-player pair, newest first', async () => {
+    mockGetScoutPlayerNotes.mockReturnValueOnce([
+      { id: 2, scout_wallet: SCOUT_A, player_id: PLAYER_ID, content: 'Follow up after cup final', created_at: 2_000_000, updated_at: 2_000_000 },
+      { id: 1, scout_wallet: SCOUT_A, player_id: PLAYER_ID, content: 'Impressive left foot',      created_at: 1_000_000, updated_at: 1_000_000 },
+    ]);
+
+    const res = await request(app)
+      .get(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data).toHaveLength(2);
+    expect(res.body.data[0].content).toBe('Follow up after cup final');
+    expect(res.body.data[0].id).toBe(2);
+    expect(mockGetScoutPlayerNotes).toHaveBeenCalledWith(SCOUT_A, PLAYER_ID);
+  });
+
+  it('returns empty array when no notes exist', async () => {
+    mockGetScoutPlayerNotes.mockReturnValueOnce([]);
+
+    const res = await request(app)
+      .get(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual([]);
+  });
+
+  it('returns 403 when scout B tries to read scout A notes', async () => {
+    const res = await request(app)
+      .get(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutBToken}`);
+
+    expect(res.status).toBe(403);
+    expect(mockGetScoutPlayerNotes).not.toHaveBeenCalled();
+  });
+
+  it('returns 401 when no token is provided', async () => {
+    const res = await request(app)
+      .get(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`);
+
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 403 when a player token is used', async () => {
+    const res = await request(app)
+      .get(`/api/scouts/${PLAYER}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${playerToken}`);
+
+    expect(res.status).toBe(403);
+  });
+
+  it('returns 403 when a validator token is used', async () => {
+    const res = await request(app)
+      .get(`/api/scouts/${PLAYER}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${validatorToken}`);
+
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─── PUT /api/scouts/:wallet/players/:playerId/notes/:noteId ──────────────────
+
+describe('PUT /api/scouts/:wallet/players/:playerId/notes/:noteId', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('updates a note and returns 200', async () => {
+    mockUpdateScoutPlayerNote.mockReturnValueOnce(true);
+
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/7`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: 'Updated — strong in the air too' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.id).toBe(7);
+    expect(res.body.data.content).toBe('Updated — strong in the air too');
+    expect(res.body.data.player_id).toBe(PLAYER_ID);
+    expect(mockUpdateScoutPlayerNote).toHaveBeenCalledTimes(1);
+    expect(mockUpdateScoutPlayerNote).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 7, scout_wallet: SCOUT_A }),
+    );
+  });
+
+  it('sanitizes content before storing', async () => {
+    mockUpdateScoutPlayerNote.mockReturnValueOnce(true);
+
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/1`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: '<b>Bold claim</b>' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.content).not.toContain('<b>');
+  });
+
+  it('returns 404 when the note does not exist or belongs to another scout', async () => {
+    mockUpdateScoutPlayerNote.mockReturnValueOnce(false);
+
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/999`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: 'Ghost note' });
+
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 400 when content is empty', async () => {
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/1`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: '' });
+
+    expect(res.status).toBe(400);
+    expect(mockUpdateScoutPlayerNote).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when content exceeds 2000 characters', async () => {
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/1`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: 'x'.repeat(2001) });
+
+    expect(res.status).toBe(400);
+    expect(mockUpdateScoutPlayerNote).not.toHaveBeenCalled();
+  });
+
+  it('returns 403 when scout B tries to update scout A note', async () => {
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/1`)
+      .set('Authorization', `Bearer ${scoutBToken}`)
+      .send({ content: 'Tampering attempt' });
+
+    expect(res.status).toBe(403);
+    expect(mockUpdateScoutPlayerNote).not.toHaveBeenCalled();
+  });
+
+  it('returns 401 when no token is provided', async () => {
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/1`)
+      .send({ content: 'No auth' });
+
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 403 when a player token is used', async () => {
+    const res = await request(app)
+      .put(`/api/scouts/${PLAYER}/players/${PLAYER_ID}/notes/1`)
+      .set('Authorization', `Bearer ${playerToken}`)
+      .send({ content: 'Wrong role' });
+
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─── DELETE /api/scouts/:wallet/players/:playerId/notes/:noteId ───────────────
+
+describe('DELETE /api/scouts/:wallet/players/:playerId/notes/:noteId', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('deletes a note and returns 200', async () => {
+    mockDeleteScoutPlayerNote.mockReturnValueOnce(true);
+
+    const res = await request(app)
+      .delete(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/5`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.removed).toBe(true);
+    expect(res.body.data.id).toBe(5);
+    expect(mockDeleteScoutPlayerNote).toHaveBeenCalledWith(5, SCOUT_A);
+  });
+
+  it('returns 404 when the note does not exist', async () => {
+    mockDeleteScoutPlayerNote.mockReturnValueOnce(false);
+
+    const res = await request(app)
+      .delete(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/999`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 403 when scout B tries to delete scout A note', async () => {
+    const res = await request(app)
+      .delete(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/1`)
+      .set('Authorization', `Bearer ${scoutBToken}`);
+
+    expect(res.status).toBe(403);
+    expect(mockDeleteScoutPlayerNote).not.toHaveBeenCalled();
+  });
+
+  it('returns 401 when no token is provided', async () => {
+    const res = await request(app)
+      .delete(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/1`);
+
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 403 when a player token is used', async () => {
+    const res = await request(app)
+      .delete(`/api/scouts/${PLAYER}/players/${PLAYER_ID}/notes/1`)
+      .set('Authorization', `Bearer ${playerToken}`);
+
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─── Full CRUD lifecycle ──────────────────────────────────────────────────────
+
+describe('full CRUD lifecycle for player notes', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('create → list → update → delete', async () => {
+    // 1. Create
+    mockInsertScoutPlayerNote.mockReturnValueOnce(10);
+    const createRes = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: 'Initial observation' });
+    expect(createRes.status).toBe(201);
+    const noteId = createRes.body.data.id;
+
+    // 2. List
+    mockGetScoutPlayerNotes.mockReturnValueOnce([
+      { id: noteId, scout_wallet: SCOUT_A, player_id: PLAYER_ID, content: 'Initial observation', created_at: 1, updated_at: 1 },
+    ]);
+    const listRes = await request(app)
+      .get(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+    expect(listRes.status).toBe(200);
+    expect(listRes.body.data).toHaveLength(1);
+    expect(listRes.body.data[0].content).toBe('Initial observation');
+
+    // 3. Update
+    mockUpdateScoutPlayerNote.mockReturnValueOnce(true);
+    const updateRes = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/${noteId}`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ content: 'Revised after second match' });
+    expect(updateRes.status).toBe(200);
+    expect(updateRes.body.data.content).toBe('Revised after second match');
+
+    // 4. Delete
+    mockDeleteScoutPlayerNote.mockReturnValueOnce(true);
+    const deleteRes = await request(app)
+      .delete(`/api/scouts/${SCOUT_A}/players/${PLAYER_ID}/notes/${noteId}`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+    expect(deleteRes.status).toBe(200);
+    expect(deleteRes.body.data.removed).toBe(true);
   });
 });

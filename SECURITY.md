@@ -2,13 +2,38 @@
 
 ## Supported Versions
 
-We release security patches for the latest version of the ScoutOff backend.
-Older versions are not guaranteed to receive backports.
+Security patches are released for the current major version line. Older
+versions are supported for a grace period after a new major release, after
+which they receive critical patches only at maintainer discretion.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| latest  | ✅ Yes             |
-| older   | ❌ No              |
+| Version | Status            | Support ends     |
+| ------- | ----------------- | ---------------- |
+| 2.x     | ✅ Active support  | Current          |
+| 1.x     | ⚠️ Security-only  | 2026-12-31       |
+| < 1.0   | ❌ Unsupported    | —                |
+
+### Disclosure SLA
+
+We commit to the following response timelines for privately reported
+security vulnerabilities:
+
+| Severity | First response | Patch targeted | Disclosure coordinated |
+| -------- | -------------- | -------------- | ---------------------- |
+| Critical | 24 hours       | 72 hours       | After patch deployed   |
+| High     | 48 hours       | 7 days         | After patch deployed   |
+| Medium   | 5 days         | 30 days        | After patch deployed   |
+| Low      | 10 days        | Next release   | Release notes          |
+
+**Critical** vulnerabilities are those that allow unauthenticated remote code
+execution, unrestricted data exfiltration, or total auth bypass with no
+preconditions. **High** vulnerabilities require some preconditions (e.g. a
+valid account) but still bypass core security boundaries.
+
+These timelines are commitments to the *reporter*, not guarantees of a public
+fix — the complexity of a fix and the need for ecosystem coordination (e.g.
+coordinating with Stellar testnet reset windows) may extend the patch timeline.
+When a delay beyond the targeted window is needed, we will communicate the
+revised timeline to the reporter within the original response window.
 
 ## Reporting a Vulnerability
 
@@ -79,3 +104,15 @@ for the full checklist.
 We thank all responsible security researchers who help keep ScoutOff safe.
 Reporters who follow this policy will be credited in the relevant release notes
 (unless they request anonymity).
+
+## Incident Response & Audit Trails
+
+When a security incident or audit occurs, the platform provides a tamper-evident audit trail for investigation and compliance:
+
+**See [docs/audit-log.md](docs/audit-log.md)** for:
+- Complete audit schema and what actions are logged
+- Hash-chain verification procedures to detect tampering
+- Using `GET /api/admin/audit/verify` to validate chain integrity
+- Interpreting verification failures and remediation steps
+
+The audit log is designed for compliance workflows (SOC 2, GDPR incident response) and post-incident forensics.

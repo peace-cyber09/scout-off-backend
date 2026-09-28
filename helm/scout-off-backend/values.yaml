@@ -27,8 +27,21 @@ imagePullSecrets: []
 # -----------------------------------------------------------------------------
 # Replica count & update strategy
 # -----------------------------------------------------------------------------
-# Minimum number of replicas. The HPA will scale up from this floor.
-replicaCount: 2
+# Number of replicas to run.
+#
+# The default deployment is a SINGLE replica backed by SQLite
+# (env.DB_DRIVER: sqlite below). SQLite is a single-process, single-file
+# database with no support for concurrent access from independent processes,
+# so with replicaCount > 1 every pod would silently get its own unshared,
+# ephemeral database file: writes to one pod would be invisible to the others
+# and data would be lost on pod restart.
+#
+# Do NOT raise this above 1 while env.DB_DRIVER=sqlite. To scale horizontally:
+#   1. switch the database to PostgreSQL (env.DB_DRIVER=postgres +
+#      env.DATABASE_URL), then
+#   2. increase replicaCount and/or enable the HPA below.
+# See docs/postgres-migration.md for the migration procedure.
+replicaCount: 1
 
 # Rolling update strategy — zero downtime: never take a pod down before a new
 # one is healthy (maxUnavailable: 0) and allow one extra pod during rollout.
@@ -42,9 +55,16 @@ strategy:
 # Horizontal Pod Autoscaler
 # -----------------------------------------------------------------------------
 hpa:
-  enabled: true
-  # Lower bound — matches replicaCount above.
-  minReplicas: 2
+  # Horizontal Pod Autoscaler.
+  #
+  # Disabled by default because the default deployment is a single
+  # SQLite-backed replica (see replicaCount above) and SQLite cannot be
+  # shared across multiple pods. Enable the HPA only after switching to
+  # PostgreSQL (env.DB_DRIVER=postgres + env.DATABASE_URL). If you enable it
+  # while still on SQLite, the chart's NOTES.txt prints a loud warning.
+  enabled: false
+  # Lower bound — only meaningful when enabled.
+  minReplicas: 1
   # Upper bound — expand to handle traffic spikes.
   maxReplicas: 10
   # Scale up when average CPU across all pods exceeds this percentage.
@@ -56,7 +76,13 @@ hpa:
 # PodDisruptionBudget
 # -----------------------------------------------------------------------------
 pdb:
-  enabled: true
+  # PodDisruptionBudget.
+  #
+  # Disabled by default to match the single-replica default: with exactly one
+  # pod, minAvailable: 1 would block ALL voluntary disruptions (node drains,
+  # cluster upgrades) indefinitely. Enable it for multi-replica
+  # (PostgreSQL-backed) deployments.
+  enabled: false
   # At least one pod must remain available during voluntary disruptions
   # (node drain, rolling upgrade, etc.).
   minAvailable: 1
@@ -141,12 +167,34 @@ readinessProbe:
 # -----------------------------------------------------------------------------
 # Kubernetes Secret reference
 #
-# Sensitive values (CONTRACT_ID, JWT_SECRET) are sourced from a pre-existing
-# Kubernetes Secret named "scout-off-secrets". Create it before deploying:
+# ALL sensitive values are sourced from a pre-existing Kubernetes Secret named
+# "scout-off-secrets". Create it before deploying:
 #
 #   kubectl create secret generic scout-off-secrets \
-#     --from-literal=CONTRACT_ID=<value> \
-#     --from-literal=JWT_SECRET=<value>
+#     --from-literal=JWT_SECRET=<min-32-char-random-string> \
+#     --from-literal=SEP10_SERVER_SECRET=<stellar-secret-key-starting-with-S> \
+#     --from-literal=PLATFORM_SECRET_KEY=<stellar-secret-key-starting-with-S> \
+#     --from-literal=API_KEY_LOOKUP_SECRET=<openssl rand -hex 32> \
+#     --from-literal=ADMIN_WALLETS=<comma-separated-stellar-addresses> \
+#     --from-literal=PINATA_API_KEY=<your-pinata-api-key> \
+#     --from-literal=PINATA_SECRET=<your-pinata-secret> \
+#     --from-literal=WEBHOOK_SECRET_ENCRYPTION_KEY=<openssl rand -hex 32> \
+#     --from-literal=REGISTER_CONTRACT_ID=<value> \
+#     --from-literal=PROGRESS_CONTRACT_ID=<value> \
+#     --from-literal=SUBSCRIPTION_CONTRACT_ID=<value> \
+#     --from-literal=CONNECTION_CONTRACT_ID=<value> \
+#     --namespace <your-namespace>
+#
+# PostgreSQL deployments must also include:
+#     --from-literal=DATABASE_URL=postgresql://user:pass@host:5432/db
+#
+# Optional rotation / legacy keys:
+#     --from-literal=CONTRACT_ID=<legacy-single-contract-id>
+#     --from-literal=JWT_SECRET_PREVIOUS=<old-secret-during-rotation>
+#     --from-literal=JWT_SECRET_PREVIOUS_UNTIL=<ISO-8601-or-unix-seconds>
+#     --from-literal=ADMIN_WALLET=<single-admin-address-for-compat>
+#     --from-literal=REDIS_URL=redis://:password@host:6379
+#     --from-literal=WEBHOOK_SECRET=<hmac-secret-for-legacy-webhook-url>
 #
 # The secret name can be overridden here if your naming convention differs.
 # -----------------------------------------------------------------------------
@@ -157,19 +205,35 @@ secretName: scout-off-secrets
 #
 # Add any env var here that does NOT contain a secret. Each key/value pair is
 # mounted into the pod via a ConfigMap named <release>-config.
-# Sensitive vars (CONTRACT_ID, JWT_SECRET) are always sourced from the Secret.
+# Sensitive vars (JWT_SECRET, SEP10_SERVER_SECRET, PLATFORM_SECRET_KEY,
+# API_KEY_LOOKUP_SECRET, ADMIN_WALLET/ADMIN_WALLETS, PINATA_API_KEY/SECRET,
+# DATABASE_URL, WEBHOOK_SECRET_ENCRYPTION_KEY, WEBHOOK_SECRET, REDIS_URL,
+# and all CONTRACT_ID vars) are always sourced from the Secret.
 # -----------------------------------------------------------------------------
 env:
   NODE_ENV: production
   PORT: "4000"
   NETWORK: mainnet
+  # Stellar network passphrase matching the NETWORK above.
+  # Mainnet: Public Global Stellar Network ; September 2015
+  # Testnet: Test SDF Network ; September 2015
+  NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015"
   HORIZON_URL: https://horizon.stellar.org
   SOROBAN_RPC_URL: https://soroban-rpc.mainnet.stellar.gateway.fm
   LOG_LEVEL: info
   METRICS_ENABLED: "true"
   # Database driver: sqlite | postgres
+  #
+  # sqlite  (default): single-process, single-file database. Suitable for the
+  #   default single-replica deployment only. SQLite has no support for
+  #   concurrent access from multiple processes, so do NOT scale beyond one
+  #   replica while this is set.
+  # postgres: required for horizontal scaling (replicaCount > 1 or HPA). Also
+  #   requires DATABASE_URL in the Secret. See docs/postgres-migration.md.
   DB_DRIVER: sqlite
   DB_PATH: /data/scout-off.db
+  # Platform fee in basis points (100 bps = 1%). Default: 500 (5%).
+  PLATFORM_FEE_BPS: "500"
   # SSE keep-alive interval in ms
   SSE_KEEPALIVE_INTERVAL_MS: "15000"
   # Maximum concurrent SSE connections (0 = unlimited)
@@ -186,6 +250,22 @@ env:
   JWT_ACCESS_TTL_SECONDS: "900"
   # Stellar health check (set false in staging)
   STELLAR_HEALTH_CHECK: "true"
+  # CORS allowed origins (comma-separated). Override per environment.
+  # Production default defined in config.ts: https://app.scoutoff.io,https://scoutoff.io
+  CORS_ALLOWED_ORIGINS: "https://app.scoutoff.io,https://scoutoff.io"
+  # Subscription grace period after expiry (hours). Default: 24.
+  SUBSCRIPTION_GRACE_PERIOD_HOURS: "24"
+  # Number of trusted reverse proxy hops in front of this server. Default: 1.
+  TRUSTED_PROXY_COUNT: "1"
+  # Webhook delivery (non-sensitive settings — URL and secrets live in the Secret)
+  WEBHOOK_ENABLED: "false"
+  WEBHOOK_TIMEOUT_MS: "10000"
+  # Slow-query warning threshold in ms. Default: 50.
+  SLOW_QUERY_THRESHOLD_MS: "50"
+  # Admin multi-sig action TTL in ms. Default: 3600000 (1 hour).
+  ADMIN_ACTION_TTL_MS: "3600000"
+  # Player cache TTL in ms. Default: 60000 (1 min).
+  PLAYER_CACHE_TTL_MS: "60000"
 
 # -----------------------------------------------------------------------------
 # Pod annotations

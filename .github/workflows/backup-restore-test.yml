@@ -29,8 +29,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The smoke test script starts the app via `npm start` (node dist/index.js),
+      # so dist/ must exist before it runs.
+      - name: Build
+        run: npm run build
+
+      # GitHub runners intermittently lose connectivity to the
+      # azure.archive.ubuntu.com mirror; point apt at the main archive mirror
+      # so apt-get update cannot hang the job.
       - name: Install sqlite3 CLI
-        run: sudo apt-get update && sudo apt-get install -y sqlite3 curl
+        run: |
+          sudo sed -i 's|//azure\.archive\.ubuntu\.com|//archive.ubuntu.com|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/apt-mirrors.txt 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 curl
 
       - name: Make scripts executable
         run: chmod +x scripts/*.sh
@@ -38,12 +50,16 @@ jobs:
       - name: Run backup-restore smoke test
         run: bash scripts/backup-restore-smoke-test.sh
         env:
-          DATABASE_PATH: /tmp/scout-off-test.db
+          DB_PATH: /tmp/scout-off-test.db
           BACKUP_DEST: /tmp/backups
           NODE_ENV: test
           LOG_LEVEL: error
           STELLAR_HEALTH_CHECK_ENABLED: false
           IPFS_ENABLED: false
+          # The script starts the real app (npm start) to smoke-test it, and
+          # src/config.ts refuses to boot without these.
+          CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+          JWT_SECRET: test-secret-min-32-chars-for-ci-only
 
       - name: Run backup verification tests
         run: npm run test -- tests/scripts/backup-verify.test.ts --forceExit
@@ -58,9 +74,10 @@ jobs:
   s3-restore-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # secrets is not a valid context for jobs.<job_id>.if, so only the
+    # event-type gate lives here — the "are credentials configured" check is
+    # applied per-step below, where the secrets context is allowed.
     if: github.event_name == 'schedule' || github.event_name == 'push'
-    # Only run if S3 credentials are configured
-    if: ${{ secrets.BACKUP_S3_BUCKET != '' && secrets.AWS_ACCESS_KEY_ID != '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -73,15 +90,35 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install sqlite3 CLI and AWS CLI
+      # secrets is not a valid context for step-level `if:` either, so resolve
+      # "are credentials configured" into a step output here (env: assignment
+      # can reference secrets) and gate later steps on that output instead.
+      - name: Check S3 credentials configured
+        id: check-creds
+        env:
+          BACKUP_S3_BUCKET: ${{ secrets.BACKUP_S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
         run: |
+          if [[ -n "${BACKUP_S3_BUCKET}" && -n "${AWS_ACCESS_KEY_ID}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install sqlite3 CLI and AWS CLI
+        if: steps.check-creds.outputs.configured == 'true'
+        run: |
+          sudo sed -i 's|//azure\.archive\.ubuntu\.com|//archive.ubuntu.com|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/apt-mirrors.txt 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y sqlite3 curl awscli
 
       - name: Make scripts executable
+        if: steps.check-creds.outputs.configured == 'true'
         run: chmod +x scripts/*.sh
 
       - name: Download and verify latest S3 backup
+        if: steps.check-creds.outputs.configured == 'true'
         run: |
           # Get the most recent backup from S3
           LATEST_BACKUP=$(aws s3 ls s3://${{ secrets.BACKUP_S3_BUCKET }}/scout-off-backups/ \
@@ -118,9 +155,10 @@ jobs:
   gcs-restore-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # secrets is not a valid context for jobs.<job_id>.if, so only the
+    # event-type gate lives here — the "are credentials configured" check is
+    # applied per-step below, where the secrets context is allowed.
     if: github.event_name == 'schedule' || github.event_name == 'push'
-    # Only run if GCS credentials are configured
-    if: ${{ secrets.BACKUP_GCS_BUCKET != '' && secrets.GCS_CREDENTIALS != '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -133,7 +171,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # secrets is not a valid context for step-level `if:` either, so resolve
+      # "are credentials configured" into a step output here (env: assignment
+      # can reference secrets) and gate later steps on that output instead.
+      - name: Check GCS credentials configured
+        id: check-creds
+        env:
+          BACKUP_GCS_BUCKET: ${{ secrets.BACKUP_GCS_BUCKET }}
+          GCS_CREDENTIALS: ${{ secrets.GCS_CREDENTIALS }}
+        run: |
+          if [[ -n "${BACKUP_GCS_BUCKET}" && -n "${GCS_CREDENTIALS}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install sqlite3 CLI and Google Cloud SDK
+        if: steps.check-creds.outputs.configured == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y sqlite3 curl
@@ -142,15 +196,18 @@ jobs:
           sudo apt-get update && sudo apt-get install -y google-cloud-sdk
 
       - name: Make scripts executable
+        if: steps.check-creds.outputs.configured == 'true'
         run: chmod +x scripts/*.sh
 
       - name: Authenticate with GCS
+        if: steps.check-creds.outputs.configured == 'true'
         run: |
           echo '${{ secrets.GCS_CREDENTIALS }}' > /tmp/gcs-credentials.json
           gcloud auth activate-service-account --key-file=/tmp/gcs-credentials.json
           gcloud config set project ${{ secrets.GCS_PROJECT_ID }}
 
       - name: Download and verify latest GCS backup
+        if: steps.check-creds.outputs.configured == 'true'
         run: |
           # Get the most recent backup from GCS
           LATEST_BACKUP=$(gsutil ls gs://${{ secrets.BACKUP_GCS_BUCKET }}/scout-off-backups/*.db 2>/dev/null | sort -r | head -1)

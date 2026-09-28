@@ -25,6 +25,11 @@ jest.mock('../../src/db', () => ({
   deletePendingPinByHash: jest.fn(),
   isPendingPinByHash: jest.fn().mockReturnValue(false),
   incrementPendingPinAttempts: jest.fn(),
+  setPendingPinResolvedCid: jest.fn(),
+  getResolvedCidByHash: jest.fn().mockReturnValue(null),
+  getStalePendingPins: jest.fn().mockReturnValue([]),
+  updatePendingPinReconciliation: jest.fn().mockReturnValue(true),
+  countStuckPendingPins: jest.fn().mockReturnValue(0),
 }));
 
 // Suppress logger noise

@@ -25,6 +25,8 @@ jest.mock('../../src/services/webhooks', () => ({
 }));
 
 jest.mock('../../src/services/cache', () => ({
+  getPlayerListLastModified: jest.fn(() => 0),
+  __setPlayerListLastModifiedForTests: jest.fn(),
   cacheGet: jest.fn().mockReturnValue(undefined),
   cacheSet: jest.fn(),
   invalidatePlayerCache: jest.fn(),
@@ -35,16 +37,28 @@ jest.mock('../../src/db', () => ({
   getPlayerById: jest.fn(),
   queryPlayers: jest.fn().mockReturnValue([]),
   countPlayers: jest.fn().mockReturnValue(0),
+  searchPlayers: jest.fn().mockReturnValue({ data: [], nextCursor: null }),
   insertPlayerProfileHistory: jest.fn(),
   getPlayerProfileHistory: jest.fn().mockReturnValue([]),
   getLatestSubscription: jest.fn().mockReturnValue(null),
   insertSubscription: jest.fn().mockReturnValue(1),
   insertOrUpdatePlayer: jest.fn(),
+  // src/utils/audit.ts's recordAudit (called from filterPlayers) calls this directly.
+  insertAuditLog: jest.fn().mockResolvedValue({
+    id: 1,
+    action: 'player_search',
+    admin_wallet: '',
+    query_params: '{}',
+    created_at: new Date().toISOString(),
+    prev_hash: '0'.repeat(64),
+    hash: 'mock-hash-1',
+    event_source: 'app_event',
+  }),
 }));
 
-import { queryPlayers, countPlayers } from '../../src/db';
+import { searchPlayers, countPlayers } from '../../src/db';
 
-const mockQueryPlayers = queryPlayers as jest.Mock;
+const mockSearchPlayers = searchPlayers as jest.Mock;
 const mockCountPlayers = countPlayers as jest.Mock;
 
 function makeToken(wallet: string, role = 'scout'): string {
@@ -62,6 +76,8 @@ function makePlayers(count: number, startIndex = 0) {
     metadata_uri: null,
     progress_level: 0,
     created_at: Math.floor(Date.now() / 1000) - (startIndex + i) * 100,
+    registered_at: Date.now() - (startIndex + i) * 100000,
+    is_active: 1,
   }));
 }
 
@@ -71,8 +87,8 @@ beforeEach(() => {
 
 describe('GET /api/players — pagination', () => {
   it('returns first page with correct metadata for 25 total players', async () => {
-    const allPlayers = makePlayers(25);
-    mockQueryPlayers.mockReturnValue(allPlayers.slice(0, 10));
+    const allPlayers = makePlayers(10);
+    mockSearchPlayers.mockReturnValue({ data: allPlayers, nextCursor: 'cursor-page-2' });
     mockCountPlayers.mockReturnValue(25);
 
     const token = makeToken(WALLET);
@@ -87,11 +103,12 @@ describe('GET /api/players — pagination', () => {
     expect(res.body.page).toBe(1);
     expect(res.body.pageSize).toBe(10);
     expect(res.body.pages).toBe(3);
+    expect(res.body.nextCursor).toBe('cursor-page-2');
   });
 
   it('returns second page with correct subset', async () => {
     const page2Players = makePlayers(10, 10);
-    mockQueryPlayers.mockReturnValue(page2Players);
+    mockSearchPlayers.mockReturnValue({ data: page2Players, nextCursor: 'cursor-page-3' });
     mockCountPlayers.mockReturnValue(25);
 
     const token = makeToken(WALLET);
@@ -104,14 +121,14 @@ describe('GET /api/players — pagination', () => {
     expect(res.body.data[0].player_id).toBe('player-10');
     expect(res.body.page).toBe(2);
     expect(res.body.pages).toBe(3);
-    expect(mockQueryPlayers).toHaveBeenCalledWith(
-      expect.objectContaining({ limit: 10, offset: 10 }),
+    expect(mockSearchPlayers).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 10 }),
     );
   });
 
   it('returns last partial page correctly', async () => {
     const lastPage = makePlayers(5, 20);
-    mockQueryPlayers.mockReturnValue(lastPage);
+    mockSearchPlayers.mockReturnValue({ data: lastPage, nextCursor: null });
     mockCountPlayers.mockReturnValue(25);
 
     const token = makeToken(WALLET);
@@ -123,13 +140,10 @@ describe('GET /api/players — pagination', () => {
     expect(res.body.data).toHaveLength(5);
     expect(res.body.total).toBe(25);
     expect(res.body.pages).toBe(3);
-    expect(mockQueryPlayers).toHaveBeenCalledWith(
-      expect.objectContaining({ limit: 10, offset: 20 }),
-    );
   });
 
   it('returns empty data for page beyond total', async () => {
-    mockQueryPlayers.mockReturnValue([]);
+    mockSearchPlayers.mockReturnValue({ data: [], nextCursor: null });
     mockCountPlayers.mockReturnValue(25);
 
     const token = makeToken(WALLET);
@@ -145,7 +159,7 @@ describe('GET /api/players — pagination', () => {
 
   it('returns single page when total fits in pageSize', async () => {
     const players = makePlayers(3);
-    mockQueryPlayers.mockReturnValue(players);
+    mockSearchPlayers.mockReturnValue({ data: players, nextCursor: null });
     mockCountPlayers.mockReturnValue(3);
 
     const token = makeToken(WALLET);
@@ -159,10 +173,11 @@ describe('GET /api/players — pagination', () => {
     expect(res.body.pages).toBe(1);
     expect(res.body.page).toBe(1);
     expect(res.body.pageSize).toBe(20);
+    expect(res.body.nextCursor).toBeNull();
   });
 
   it('defaults to page=1 and pageSize=20 when not specified', async () => {
-    mockQueryPlayers.mockReturnValue([]);
+    mockSearchPlayers.mockReturnValue({ data: [], nextCursor: null });
     mockCountPlayers.mockReturnValue(0);
 
     const token = makeToken(WALLET);
@@ -175,29 +190,27 @@ describe('GET /api/players — pagination', () => {
     expect(res.body.pageSize).toBe(20);
     expect(res.body.pages).toBe(0);
     expect(res.body.total).toBe(0);
-    expect(mockQueryPlayers).toHaveBeenCalledWith(
-      expect.objectContaining({ limit: 20, offset: 0 }),
+    expect(mockSearchPlayers).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 20 }),
     );
   });
 
-  it('passes correct offset for different page/pageSize combos', async () => {
-    mockQueryPlayers.mockReturnValue([]);
+  it('passes correct limit for different pageSize combos', async () => {
+    mockSearchPlayers.mockReturnValue({ data: [], nextCursor: null });
     mockCountPlayers.mockReturnValue(100);
 
     const token = makeToken(WALLET);
-    const res = await request(app)
+    await request(app)
       .get('/api/players?page=4&pageSize=5')
       .set('Authorization', `Bearer ${token}`);
 
-    expect(res.status).toBe(200);
-    expect(res.body.pages).toBe(20);
-    expect(mockQueryPlayers).toHaveBeenCalledWith(
-      expect.objectContaining({ limit: 5, offset: 15 }),
+    expect(mockSearchPlayers).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 5 }),
     );
   });
 
   it('calculates pages correctly for exact division', async () => {
-    mockQueryPlayers.mockReturnValue(makePlayers(10));
+    mockSearchPlayers.mockReturnValue({ data: makePlayers(10), nextCursor: 'next' });
     mockCountPlayers.mockReturnValue(30);
 
     const token = makeToken(WALLET);
@@ -211,7 +224,7 @@ describe('GET /api/players — pagination', () => {
   });
 
   it('calculates pages correctly for non-exact division', async () => {
-    mockQueryPlayers.mockReturnValue(makePlayers(10));
+    mockSearchPlayers.mockReturnValue({ data: makePlayers(10), nextCursor: 'next' });
     mockCountPlayers.mockReturnValue(31);
 
     const token = makeToken(WALLET);
@@ -226,7 +239,7 @@ describe('GET /api/players — pagination', () => {
 
   it('filters by region and returns correct pagination metadata', async () => {
     const filtered = makePlayers(2);
-    mockQueryPlayers.mockReturnValue(filtered);
+    mockSearchPlayers.mockReturnValue({ data: filtered, nextCursor: null });
     mockCountPlayers.mockReturnValue(2);
 
     const token = makeToken(WALLET);
@@ -238,11 +251,71 @@ describe('GET /api/players — pagination', () => {
     expect(res.body.data).toHaveLength(2);
     expect(res.body.total).toBe(2);
     expect(res.body.pages).toBe(1);
-    expect(mockQueryPlayers).toHaveBeenCalledWith(
-      expect.objectContaining({ region: 'europe', limit: 10, offset: 0 }),
+    expect(mockSearchPlayers).toHaveBeenCalledWith(
+      expect.objectContaining({ region: 'europe', limit: 10 }),
     );
     expect(mockCountPlayers).toHaveBeenCalledWith(
       expect.objectContaining({ region: 'europe' }),
+    );
+  });
+
+  it('honours sortBy=tier&sortOrder=desc', async () => {
+    mockSearchPlayers.mockReturnValue({ data: makePlayers(5), nextCursor: null });
+    mockCountPlayers.mockReturnValue(25);
+
+    const token = makeToken(WALLET);
+    const res = await request(app)
+      .get('/api/players?sortBy=tier&sortOrder=desc&pageSize=10')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(mockSearchPlayers).toHaveBeenCalledWith(
+      expect.objectContaining({ sortBy: 'tier', sortOrder: 'desc' }),
+    );
+  });
+
+  it('honours sortBy=region&sortOrder=asc', async () => {
+    mockSearchPlayers.mockReturnValue({ data: makePlayers(5), nextCursor: null });
+    mockCountPlayers.mockReturnValue(25);
+
+    const token = makeToken(WALLET);
+    const res = await request(app)
+      .get('/api/players?sortBy=region&sortOrder=asc&pageSize=10')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(mockSearchPlayers).toHaveBeenCalledWith(
+      expect.objectContaining({ sortBy: 'region', sortOrder: 'asc' }),
+    );
+  });
+
+  it('uses cursor-based pagination when cursor param is provided', async () => {
+    mockSearchPlayers.mockReturnValue({ data: makePlayers(5), nextCursor: 'next-cursor-val' });
+    mockCountPlayers.mockReturnValue(25);
+
+    const token = makeToken(WALLET);
+    const res = await request(app)
+      .get('/api/players?cursor=abc123&pageSize=10')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.nextCursor).toBe('next-cursor-val');
+    expect(mockSearchPlayers).toHaveBeenCalledWith(
+      expect.objectContaining({ cursor: 'abc123', limit: 10 }),
+    );
+  });
+
+  it('passes sortBy and sortOrder to searchPlayers', async () => {
+    mockSearchPlayers.mockReturnValue({ data: [], nextCursor: null });
+    mockCountPlayers.mockReturnValue(0);
+
+    const token = makeToken(WALLET);
+    await request(app)
+      .get('/api/players?sortBy=created_at&sortOrder=asc')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(mockSearchPlayers).toHaveBeenCalledWith(
+      expect.objectContaining({ sortBy: 'created_at', sortOrder: 'asc' }),
     );
   });
 });

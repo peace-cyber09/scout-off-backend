@@ -1,6 +1,6 @@
 import {
   Contract,
-  SorobanRpc,
+  rpc,
   TransactionBuilder,
   BASE_FEE,
   xdr,
@@ -9,6 +9,7 @@ import {
   Keypair,
 } from '@stellar/stellar-sdk';
 import { server, networkPassphrase } from '../services/stellar';
+import { correlationMemoFromContext, recordTxCorrelation } from '../services/txCorrelation';
 import config from '../config';
 
 // ─── Typed errors ─────────────────────────────────────────────────────────────
@@ -66,10 +67,13 @@ export async function invokeContract(
   }
 
   const contract = new Contract(config.contractId);
-  const tx = new TransactionBuilder(account, {
+  const txOpts: ConstructorParameters<typeof TransactionBuilder>[1] = {
     fee: BASE_FEE,
     networkPassphrase: networkPassphrase(),
-  })
+  };
+  const memo = correlationMemoFromContext();
+  if (memo) txOpts.memo = memo;
+  const tx = new TransactionBuilder(account, txOpts)
     .addOperation(contract.call(method, ...args))
     .setTimeout(Math.ceil(timeoutMs / 1000))
     .build();
@@ -81,17 +85,18 @@ export async function invokeContract(
   } catch (err) {
     throw new ContractNetworkError(`Simulation request failed: ${(err as Error).message}`);
   }
-  if (SorobanRpc.Api.isSimulationError(simResult)) {
+  if (rpc.Api.isSimulationError(simResult)) {
     throw new ContractExecutionError(`Simulation failed: ${simResult.error}`);
   }
 
-  const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
+  const preparedTx = rpc.assembleTransaction(tx, simResult).build();
   preparedTx.sign(keypair);
 
   // Submit
   let sendResult;
   try {
     sendResult = await server.sendTransaction(preparedTx);
+    if (sendResult.hash) recordTxCorrelation(sendResult.hash);
   } catch (err) {
     throw new ContractNetworkError(`Submit request failed: ${(err as Error).message}`);
   }
@@ -103,7 +108,7 @@ export async function invokeContract(
   const deadline = Date.now() + timeoutMs;
   let getResult = await server.getTransaction(sendResult.hash);
 
-  while (getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
+  while (getResult.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
     if (Date.now() >= deadline) {
       throw new ContractTimeoutError(`Transaction ${sendResult.hash} not confirmed within ${timeoutMs}ms`);
     }
@@ -111,11 +116,11 @@ export async function invokeContract(
     getResult = await server.getTransaction(sendResult.hash);
   }
 
-  if (getResult.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+  if (getResult.status === rpc.Api.GetTransactionStatus.FAILED) {
     throw new ContractExecutionError(`Transaction ${sendResult.hash} failed on-chain`);
   }
 
-  const success = getResult as SorobanRpc.Api.GetSuccessfulTransactionResponse;
+  const success = getResult as rpc.Api.GetSuccessfulTransactionResponse;
   return {
     hash: sendResult.hash,
     returnValue: success.returnValue ?? xdr.ScVal.scvVoid(),

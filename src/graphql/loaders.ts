@@ -13,6 +13,7 @@
 import DataLoader from 'dataloader';
 import { queryEvents } from '../db';
 import { queryMilestones } from '../services/stellar';
+import { withConcurrencyLimit } from '../utils/concurrency';
 
 export interface GqlMilestone {
   milestoneId: string | null;
@@ -61,9 +62,22 @@ async function batchLoadMilestones(
     });
   }
 
-  // ── Step 2: on-chain milestones — batched in parallel ─────────────────────
-  const onChainResults = await Promise.allSettled(
-    playerIds.map((pid) => queryMilestones(pid)),
+  // ── Step 2: on-chain milestones — bounded concurrency pool ───────────────
+  //
+  // Without a concurrency cap a `players(pageSize: 100) { milestones }` query
+  // fires 100 simultaneous Soroban RPC calls, competing with the indexer and
+  // every other request for the shared RPC client and circuit-breaker budget.
+  //
+  // MILESTONE_LOADER_CONCURRENCY caps the number of in-flight RPC calls.
+  // Default: 8.  Configurable via the MILESTONE_LOADER_CONCURRENCY env var.
+  const concurrencyLimit = parseInt(
+    process.env.MILESTONE_LOADER_CONCURRENCY ?? '8',
+    10,
+  );
+
+  const onChainResults = await withConcurrencyLimit(
+    playerIds.map((pid) => () => queryMilestones(pid)),
+    concurrencyLimit,
   );
 
   // ── Step 3: merge, preserving DataLoader key order ────────────────────────

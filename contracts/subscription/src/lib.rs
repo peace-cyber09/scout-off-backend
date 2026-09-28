@@ -257,16 +257,41 @@ impl SubscriptionContract {
         Self::calculate_contact_fee(&env)
     }
 
+    /// Return the accumulated platform fee balance in stroops.
+    ///
+    /// View-only (no auth required). Returns 0 when no fees have accrued.
+    /// The backend reads this via `get_fee_balance()` before proposing a
+    /// withdrawal so it can reject over-balance requests client-side too.
+    pub fn get_fee_balance(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformFeeBalance)
+            .unwrap_or(0)
+    }
+
     /// Withdraw accumulated platform fees to the admin address.
     ///
-    /// Requires admin auth. Transfers all accumulated fees from this contract
-    /// to the admin, resets the balance, and emits fees_withdrawn.
-    pub fn withdraw_fees(env: Env, admin: Address) -> Result<i128, Error> {
+    /// Requires admin auth. Transfers exactly `amount` stroops from this
+    /// contract to the admin, decrements the stored balance by that amount,
+    /// and emits fees_withdrawn with the actually-withdrawn amount (the
+    /// return value), so a caller-specified partial withdrawal is enforced
+    /// on-chain rather than silently draining the whole vault.
+    ///
+    /// Rejects with Error::InvalidInput when `amount <= 0` and with
+    /// Error::InsufficientFee when `amount` exceeds the available balance —
+    /// this balance check is authoritative: the backend re-checks it via
+    /// get_fee_balance() before submitting, but the contract is the final
+    /// guard against withdrawing more than it holds.
+    pub fn withdraw_fees(env: Env, admin: Address, amount: i128) -> Result<i128, Error> {
         if !is_initialized(&env) {
             return Err(Error::NotInitialized);
         }
         if is_paused(&env) {
             return Err(Error::ContractPaused);
+        }
+
+        if amount <= 0 {
+            return Err(Error::InvalidInput);
         }
 
         let stored_admin: Address = env
@@ -286,8 +311,8 @@ impl SubscriptionContract {
             .get(&DataKey::PlatformFeeBalance)
             .unwrap_or(0);
 
-        if balance <= 0 {
-            return Ok(0);
+        if amount > balance {
+            return Err(Error::InsufficientFee);
         }
 
         let token_addr: Address = env
@@ -296,19 +321,20 @@ impl SubscriptionContract {
             .get(&DataKey::Token)
             .ok_or(Error::NotInitialized)?;
         let token = TokenClient::new(&env, &token_addr);
-        token.transfer(&env.current_contract_address(), &admin, &balance);
+        token.transfer(&env.current_contract_address(), &admin, &amount);
 
+        let remaining = balance - amount;
         env.storage()
             .instance()
-            .set(&DataKey::PlatformFeeBalance, &0i128);
+            .set(&DataKey::PlatformFeeBalance, &remaining);
 
         env.events().publish(
             (Symbol::new(&env, "fees_withdrawn"),),
-            (admin.clone(), balance),
+            (admin.clone(), amount),
         );
 
         bump_instance(&env);
-        Ok(balance)
+        Ok(amount)
     }
 
     /// Update the platform fee in basis points. Only the admin may call this.
@@ -324,6 +350,121 @@ impl SubscriptionContract {
         env.storage()
             .instance()
             .set(&DataKey::PlatformFeeBps, &platform_fee_bps);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    // ── Pause / Unpause ────────────────────────────────────────────────────
+
+    /// Pause the contract, preventing all state-changing operations.
+    ///
+    /// Only the admin address set during [`initialize`] may call this function.
+    /// The guard is already wired into [`subscribe`], [`pay_to_contact`], and
+    /// [`withdraw_fees`] via [`is_paused`].  If the contract is already paused
+    /// the call is a no-op (returns `Ok`).
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`] — Contract has not been initialized.
+    /// * [`Error::Unauthorized`] — Caller is not the admin.
+    pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
+        if !is_initialized(&env) {
+            return Err(Error::NotInitialized);
+        }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        scout_off_shared::storage::set_paused(&env, true);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Unpause the contract, re-enabling all state-changing operations.
+    ///
+    /// Only the admin address may call this.  If the contract is not currently
+    /// paused the call is a no-op (returns `Ok`).
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`] — Contract has not been initialized.
+    /// * [`Error::Unauthorized`] — Caller is not the admin.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), Error> {
+        if !is_initialized(&env) {
+            return Err(Error::NotInitialized);
+        }
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        scout_off_shared::storage::set_paused(&env, false);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    // ── cancel_subscription ────────────────────────────────────────────────
+
+    /// Cancel the caller's active subscription, marking it as immediately expired.
+    ///
+    /// Semantics:
+    /// * The scout must have an active (non-expired) subscription; otherwise
+    ///   [`Error::NotSubscribed`] (code 8) is returned.
+    /// * No fee refund is issued — the scout forfeits the remaining subscription
+    ///   period.  This matches the documented no-refund policy.
+    /// * After cancellation [`is_subscribed`] returns `false` for this scout.
+    ///
+    /// The backend's `cancelSubscriptionOnChain` already maps error code 8 to
+    /// `SubscriptionError('NOT_SUBSCRIBED')`, so no backend change is needed
+    /// for the error path.
+    ///
+    /// # Errors
+    /// * [`Error::NotInitialized`] — Contract has not been initialized.
+    /// * [`Error::ContractPaused`] — Contract is paused.
+    /// * [`Error::NotSubscribed`] — Scout has no active subscription or it has
+    ///   already expired/been cancelled.
+    pub fn cancel_subscription(env: Env, scout: Address) -> Result<(), Error> {
+        if !is_initialized(&env) {
+            return Err(Error::NotInitialized);
+        }
+        if is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        scout.require_auth();
+
+        let sub_key = DataKey::Subscription(scout.clone());
+        let record: SubscriptionRecord = env
+            .storage()
+            .instance()
+            .get(&sub_key)
+            .ok_or(Error::NotSubscribed)?;
+
+        // Reject if the subscription is already expired or previously cancelled
+        // (expires_at == 0 is the sentinel we write below).
+        if env.ledger().sequence() >= record.expires_at || record.expires_at == 0 {
+            return Err(Error::NotSubscribed);
+        }
+
+        // Mark as cancelled by setting expires_at to the current ledger (= expired now).
+        let cancelled = SubscriptionRecord {
+            tier: record.tier,
+            expires_at: env.ledger().sequence(),
+            tx_hash: record.tx_hash,
+        };
+        env.storage().instance().set(&sub_key, &cancelled);
+
+        env.events().publish(
+            (Symbol::new(&env, "sub_cancelled"), scout.clone()),
+            (record.tier,),
+        );
+
         bump_instance(&env);
         Ok(())
     }
@@ -396,7 +537,11 @@ mod tests {
         let env = Env::default();
         let (client, admin, token) = setup(&env);
         client.initialize(&admin, &token, &500u32);
-        scout_off_shared::storage::set_paused(&env, true);
+        // Storage access is only permitted from within a contract's own
+        // execution context — wrap the direct storage write accordingly.
+        env.as_contract(&client.address, || {
+            scout_off_shared::storage::set_paused(&env, true);
+        });
         let scout = Address::generate(&env);
         fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
         let result = client.try_subscribe(&scout, &1u32, &10u32);
@@ -491,8 +636,10 @@ mod tests {
         let scout = Address::generate(&env);
         fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
         client.subscribe(&scout, &1u32, &30u32);
-        let withdrawn = client.withdraw_fees(&admin);
-        assert!(withdrawn > 0);
+        // fee = 1_000_000 × 1 × 30 = 30_000_000 stroops
+        let withdrawn = client.withdraw_fees(&admin, &30_000_000i128);
+        assert_eq!(withdrawn, 30_000_000);
+        assert_eq!(client.get_fee_balance(), 0);
     }
 
     #[test]
@@ -504,8 +651,76 @@ mod tests {
         fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
         client.subscribe(&scout, &1u32, &30u32);
         let non_admin = Address::generate(&env);
-        let result = client.try_withdraw_fees(&non_admin);
+        let result = client.try_withdraw_fees(&non_admin, &30_000_000i128);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn withdraw_fees_partial_amount_withdraws_only_requested() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        let scout = Address::generate(&env);
+        fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
+        client.subscribe(&scout, &1u32, &30u32);
+
+        // Subscription fee: BASE_FEE_STROOPS (1_000_000) × tier-1 multiplier × 30 days.
+        let total: i128 = 30_000_000;
+        let partial: i128 = 10_000_000;
+
+        let token_client = TokenClient::new(&env, &token);
+        assert_eq!(token_client.balance(&client.address), total);
+
+        // A partial withdrawal moves only the requested amount on-chain —
+        // not the full balance.
+        let withdrawn = client.withdraw_fees(&admin, &partial);
+        assert_eq!(withdrawn, partial);
+        assert_eq!(token_client.balance(&client.address), total - partial);
+        assert_eq!(client.get_fee_balance(), total - partial);
+
+        // The remainder can be withdrawn afterwards — the vault drains to zero.
+        let withdrawn_rest = client.withdraw_fees(&admin, &(total - partial));
+        assert_eq!(withdrawn_rest, total - partial);
+        assert_eq!(client.get_fee_balance(), 0);
+        assert_eq!(token_client.balance(&client.address), 0);
+    }
+
+    #[test]
+    fn withdraw_fees_rejects_amount_exceeding_balance() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        let scout = Address::generate(&env);
+        fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
+        client.subscribe(&scout, &1u32, &30u32);
+
+        let result = client.try_withdraw_fees(&admin, &30_000_001i128);
+        assert_eq!(result, Err(Ok(Error::InsufficientFee)));
+        // The rejected call leaves the vault untouched.
+        assert_eq!(client.get_fee_balance(), 30_000_000);
+    }
+
+    #[test]
+    fn withdraw_fees_rejects_zero_and_negative_amounts() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+
+        assert!(client.try_withdraw_fees(&admin, &0i128).is_err());
+        assert!(client.try_withdraw_fees(&admin, &-1i128).is_err());
+    }
+
+    #[test]
+    fn get_fee_balance_tracks_accrued_fees() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        assert_eq!(client.get_fee_balance(), 0);
+
+        let scout = Address::generate(&env);
+        fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
+        client.subscribe(&scout, &1u32, &30u32);
+        assert_eq!(client.get_fee_balance(), 30_000_000);
     }
 
     #[test]
@@ -534,6 +749,134 @@ mod tests {
         let not_admin = Address::generate(&env);
         let result = client.try_set_platform_fee_bps(&not_admin, &250u32);
         assert!(result.is_err());
+    }
+
+    // ── pause / unpause ──────────────────────────────────────────────────────
+
+    #[test]
+    fn pause_and_unpause_round_trip() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        // Pause.
+        assert!(client.try_pause(&admin).is_ok());
+        // Operations should fail while paused.
+        let scout = Address::generate(&env);
+        fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
+        assert!(client.try_subscribe(&scout, &1u32, &30u32).is_err());
+        // Unpause.
+        assert!(client.try_unpause(&admin).is_ok());
+        // Operations should succeed again.
+        assert!(client.try_subscribe(&scout, &1u32, &30u32).is_ok());
+    }
+
+    #[test]
+    fn non_admin_cannot_pause() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        let non_admin = Address::generate(&env);
+        assert!(client.try_pause(&non_admin).is_err());
+    }
+
+    #[test]
+    fn non_admin_cannot_unpause() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        assert!(client.try_pause(&admin).is_ok());
+        let non_admin = Address::generate(&env);
+        assert!(client.try_unpause(&non_admin).is_err());
+    }
+
+    // ── cancel_subscription ──────────────────────────────────────────────────
+
+    #[test]
+    fn cancel_subscription_makes_scout_inactive() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        let scout = Address::generate(&env);
+        fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
+        client.subscribe(&scout, &1u32, &30u32);
+        assert!(client.is_subscribed(&scout));
+        // Cancel.
+        assert!(client.try_cancel_subscription(&scout).is_ok());
+        assert!(!client.is_subscribed(&scout));
+    }
+
+    #[test]
+    fn cancel_subscription_on_no_subscription_returns_not_subscribed() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        let scout = Address::generate(&env);
+        let result = client.try_cancel_subscription(&scout);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancel_already_expired_subscription_returns_not_subscribed() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        let scout = Address::generate(&env);
+        fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
+        client.subscribe(&scout, &1u32, &1u32);
+        // Advance past expiry.
+        env.ledger().with_mut(|li| { li.sequence_number += LEDGERS_PER_DAY + 10; });
+        // Subscription is expired; cancel should return NotSubscribed.
+        let result = client.try_cancel_subscription(&scout);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancel_subscription_when_paused_returns_paused_error() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        let scout = Address::generate(&env);
+        fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
+        client.subscribe(&scout, &1u32, &30u32);
+        client.pause(&admin);
+        let result = client.try_cancel_subscription(&scout);
+        assert!(result.is_err());
+    }
+
+    // ── get_fee_balance ──────────────────────────────────────────────────────
+
+    #[test]
+    fn get_fee_balance_returns_zero_before_any_payment() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        assert_eq!(client.get_fee_balance(), 0i128);
+    }
+
+    #[test]
+    fn get_fee_balance_increases_after_subscription() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        let scout = Address::generate(&env);
+        fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
+        client.subscribe(&scout, &1u32, &30u32);
+        let balance = client.get_fee_balance();
+        assert!(balance > 0, "fee balance must be positive after subscription");
+    }
+
+    #[test]
+    fn get_fee_balance_resets_to_zero_after_withdraw() {
+        let env = Env::default();
+        let (client, admin, token) = setup(&env);
+        client.initialize(&admin, &token, &500u32);
+        let scout = Address::generate(&env);
+        fund(&env, &token, &admin, &scout, 1_000_000_000_000i128);
+        client.subscribe(&scout, &1u32, &30u32);
+        let balance = client.get_fee_balance();
+        assert!(balance > 0);
+        client.withdraw_fees(&admin, &balance);
+        assert_eq!(client.get_fee_balance(), 0i128);
     }
 
     #[test]

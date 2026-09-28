@@ -5,7 +5,7 @@ import { tierForApprovedMilestones, TIER_THRESHOLDS } from '../../src/services/t
 // The indexer reaches out to the chain and to the webhook dispatcher; stub both
 // so the test exercises only the DB-backed tier-promotion path.
 jest.mock('../../src/services/stellar', () => ({
-  server: { queryEvents: jest.fn() },
+  server: { getEvents: jest.fn() },
 }));
 jest.mock('../../src/services/webhooks', () => ({
   dispatchEventWebhook: jest.fn().mockResolvedValue(undefined),
@@ -13,13 +13,17 @@ jest.mock('../../src/services/webhooks', () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { server } = require('../../src/services/stellar') as {
-  server: { queryEvents: jest.Mock };
+  server: { getEvents: jest.Mock };
 };
 
 function rawEvent(type: string, payload: Record<string, unknown>, txHash: string, ledger: number) {
+  // In @stellar/stellar-sdk v16+, topic items and value are xdr.ScVal
+  // discriminated-union objects. scValToNative() is called on them in indexer.ts.
+  // Use nativeToScVal() to produce valid ScVal objects the indexer can consume.
+  const { nativeToScVal } = require('@stellar/stellar-sdk');
   return {
-    topic: [{ value: () => type }],
-    value: { value: () => payload },
+    topic: [nativeToScVal(type, { type: 'symbol' })],
+    value: nativeToScVal(payload),
     ledger,
     txHash,
   };
@@ -153,14 +157,14 @@ describe('indexEvents — player tier in DB matches approved-milestone count (#3
     const nextHash = () => `tx-${player}-${seq++}`;
 
     // Register the player — starts at tier 0.
-    server.queryEvents.mockResolvedValue({
+    server.getEvents.mockResolvedValue({
       latestLedger: ledger,
       events: [
         rawEvent('player_registered', { player_id: player, wallet: 'GWALLET' }, nextHash(), ledger++),
       ],
     });
     await indexEvents();
-    expect(getPlayerById(player)?.progress_level).toBe(0);
+    expect((await getPlayerById(player))?.progress_level).toBe(0);
 
     // Helper: approve `n` more milestones in a single indexer batch.
     const approve = async (n: number) => {
@@ -168,18 +172,18 @@ describe('indexEvents — player tier in DB matches approved-milestone count (#3
       for (let i = 0; i < n; i++) {
         events.push(rawEvent('milestone_approved', { player_id: player }, nextHash(), ledger++));
       }
-      server.queryEvents.mockResolvedValue({ latestLedger: ledger, events });
+      server.getEvents.mockResolvedValue({ latestLedger: ledger, events });
       await indexEvents();
     };
 
     await approve(1); // total 1 approved → tier 1
-    expect(getPlayerById(player)?.progress_level).toBe(1);
+    expect((await getPlayerById(player))?.progress_level).toBe(1);
 
     await approve(2); // total 3 approved → tier 2
-    expect(getPlayerById(player)?.progress_level).toBe(2);
+    expect((await getPlayerById(player))?.progress_level).toBe(2);
 
     await approve(3); // total 6 approved → tier 3
-    expect(getPlayerById(player)?.progress_level).toBe(3);
+    expect((await getPlayerById(player))?.progress_level).toBe(3);
   });
 
   it('counts milestones per player — one player\'s approvals do not promote another', async () => {
@@ -189,7 +193,7 @@ describe('indexEvents — player tier in DB matches approved-milestone count (#3
     let seq = 0;
     const nextHash = () => `tx-multi-${seq++}`;
 
-    server.queryEvents.mockResolvedValue({
+    server.getEvents.mockResolvedValue({
       latestLedger: ledger,
       events: [
         rawEvent('player_registered', { player_id: alice, wallet: 'GA' }, nextHash(), ledger++),
@@ -203,8 +207,8 @@ describe('indexEvents — player tier in DB matches approved-milestone count (#3
     });
     await indexEvents();
 
-    expect(getPlayerById(alice)?.progress_level).toBe(2); // 3 milestones → tier 2
-    expect(getPlayerById(bob)?.progress_level).toBe(1); // 1 milestone → tier 1
+    expect((await getPlayerById(alice))?.progress_level).toBe(2); // 3 milestones → tier 2
+    expect((await getPlayerById(bob))?.progress_level).toBe(1); // 1 milestone → tier 1
   });
 
   it('player already at tier 3 stays at tier 3 when additional milestones are approved', async () => {
@@ -220,17 +224,17 @@ describe('indexEvents — player tier in DB matches approved-milestone count (#3
     for (let i = 0; i < 6; i++) {
       events.push(rawEvent('milestone_approved', { player_id: player }, nextHash(), ledger++));
     }
-    server.queryEvents.mockResolvedValue({ latestLedger: ledger, events });
+    server.getEvents.mockResolvedValue({ latestLedger: ledger, events });
     await indexEvents();
-    expect(getPlayerById(player)?.progress_level).toBe(3);
+    expect((await getPlayerById(player))?.progress_level).toBe(3);
 
     // Approve 3 more milestones — player must remain at tier 3.
     const moreEvents = [];
     for (let i = 0; i < 3; i++) {
       moreEvents.push(rawEvent('milestone_approved', { player_id: player }, nextHash(), ledger++));
     }
-    server.queryEvents.mockResolvedValue({ latestLedger: ledger, events: moreEvents });
+    server.getEvents.mockResolvedValue({ latestLedger: ledger, events: moreEvents });
     await indexEvents();
-    expect(getPlayerById(player)?.progress_level).toBe(3);
+    expect((await getPlayerById(player))?.progress_level).toBe(3);
   });
 });

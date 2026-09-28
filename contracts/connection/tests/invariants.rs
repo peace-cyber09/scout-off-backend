@@ -20,9 +20,29 @@ mod connection_invariants {
     use connection::{ConnectionContract, ConnectionContractClient};
     use register::{RegisterContract, RegisterContractClient};
     use subscription::{SubscriptionContract, SubscriptionContractClient};
-    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    use soroban_sdk::{
+        testutils::Address as _,
+        token::StellarAssetClient,
+        Address, Env, String,
+    };
 
     // ── helpers ──────────────────────────────────────────────────────────────
+
+    /// Number of cases to run per proptest! block. Defaults to 10 000 (the
+    /// project standard) but can be overridden via PROPTEST_CASES — e.g. CI
+    /// uses a smaller value for fast PR feedback within its time budget,
+    /// while nightly/local runs keep the full 10 000.
+    fn proptest_cases() -> u32 {
+        std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000)
+    }
+
+    /// Any scout balance used in these tests only needs to cover subscribe()/
+    /// pay_to_contact() fees, which are small relative to this — one mint per
+    /// scout is enough for the whole proptest case.
+    const SCOUT_FUNDING: i128 = 1_000_000_000_000_000i128;
 
     fn setup(
         env: &Env,
@@ -31,10 +51,15 @@ mod connection_invariants {
         RegisterContractClient<'_>,
         SubscriptionContractClient<'_>,
         Address, // admin
+        Address, // token
     ) {
         env.mock_all_auths();
         let admin = Address::generate(env);
-        let token = Address::generate(env);
+        // subscribe()/pay_to_contact() transfer real tokens via TokenClient, so
+        // the "token" address must be a live Stellar Asset Contract, not a bare
+        // generated Address — otherwise every transfer call traps with
+        // Error(Storage, MissingValue) (no contract instance to invoke).
+        let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
 
         let reg_id = env.register_contract(None, RegisterContract);
         let sub_id = env.register_contract(None, SubscriptionContract);
@@ -49,7 +74,13 @@ mod connection_invariants {
         conn.initialize(&admin, &reg_id, &sub_id);
         reg.set_authorized_updater(&conn_id);
 
-        (conn, reg, sub, admin)
+        (conn, reg, sub, admin, token)
+    }
+
+    /// Mint `SCOUT_FUNDING` tokens to `scout` so its subscribe()/pay_to_contact()
+    /// transfer calls have a sufficient balance.
+    fn fund_scout(env: &Env, token: &Address, scout: &Address) {
+        StellarAssetClient::new(env, token).mint(scout, &SCOUT_FUNDING);
     }
 
     fn new_player(env: &Env, reg: &RegisterContractClient<'_>) -> u64 {
@@ -69,7 +100,7 @@ mod connection_invariants {
     // ── C1: no duplicate connections per (scout, player_id) ──────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// Calling log_trial_offer n times for the same (scout, player_id) must leave
         /// get_connections returning exactly 1 record for that scout.
@@ -79,8 +110,9 @@ mod connection_invariants {
             use_subscription in any::<bool>(),
         ) {
             let env = Env::default();
-            let (conn, reg, sub, _) = setup(&env);
+            let (conn, reg, sub, _, token) = setup(&env);
             let scout = Address::generate(&env);
+            fund_scout(&env, &token, &scout);
             let player_id = new_player(&env, &reg);
 
             if use_subscription {
@@ -117,7 +149,7 @@ mod connection_invariants {
     // ── C2: connection count equals number of distinct player_ids contacted ───
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// After contacting n distinct players, get_trial_offers must return exactly n records.
         #[test]
@@ -125,8 +157,9 @@ mod connection_invariants {
             n in 1usize..=10,
         ) {
             let env = Env::default();
-            let (conn, reg, sub, _) = setup(&env);
+            let (conn, reg, sub, _, token) = setup(&env);
             let scout = Address::generate(&env);
+            fund_scout(&env, &token, &scout);
 
             // Single subscription covers all players.
             sub.subscribe(&scout, &1u32, &100_000u32);
@@ -150,7 +183,7 @@ mod connection_invariants {
     // ── C3: successful log_trial_offer always sets player level to exactly 3 ──
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// For any starting level in [0, 3], a successful log_trial_offer must leave
         /// the player's progress_level at exactly 3.
@@ -159,8 +192,9 @@ mod connection_invariants {
             starting_level in 0u32..=3u32,
         ) {
             let env = Env::default();
-            let (conn, reg, sub, _) = setup(&env);
+            let (conn, reg, sub, _, token) = setup(&env);
             let scout = Address::generate(&env);
+            fund_scout(&env, &token, &scout);
             let player_id = new_player(&env, &reg);
 
             // Set the starting level directly via the register contract.
@@ -182,14 +216,14 @@ mod connection_invariants {
     // ── C4: unauthorized scouts are always rejected ───────────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// A scout with neither a subscription nor a paid contact fee must always
         /// receive an error, and the player's progress_level must remain unchanged.
         #[test]
         fn prop_unauthorized_scout_always_rejected(_seed in 0u64..u64::MAX) {
             let env = Env::default();
-            let (conn, reg, _sub, _) = setup(&env);
+            let (conn, reg, _sub, _, _token) = setup(&env);
             let scout = Address::generate(&env);
             let player_id = new_player(&env, &reg);
 
@@ -212,7 +246,7 @@ mod connection_invariants {
     // ── C5: original URI is preserved on duplicate calls ─────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// No matter how many times log_trial_offer is called with different URIs,
         /// get_connections always returns the URI from the very first successful call.
@@ -221,8 +255,9 @@ mod connection_invariants {
             n_extra in 1usize..=8,
         ) {
             let env = Env::default();
-            let (conn, reg, sub, _) = setup(&env);
+            let (conn, reg, sub, _, token) = setup(&env);
             let scout = Address::generate(&env);
+            fund_scout(&env, &token, &scout);
             let player_id = new_player(&env, &reg);
 
             sub.subscribe(&scout, &1u32, &100_000u32);
@@ -250,7 +285,7 @@ mod connection_invariants {
     // ── C6: player progress_level never decreases across valid operations ─────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// A mixed sequence of subscription, contact-fee, and log_trial_offer operations
         /// for multiple scouts targeting the same player must never decrease the player's
@@ -264,12 +299,16 @@ mod connection_invariants {
             ),
         ) {
             let env = Env::default();
-            let (conn, reg, sub, _) = setup(&env);
+            let (conn, reg, sub, _, token) = setup(&env);
 
             // Pool of 3 players.
             let player_ids: Vec<u64> = (0..3).map(|_| new_player(&env, &reg)).collect();
             let scout = Address::generate(&env);
-            sub.subscribe(&scout, &1u32, &1_000_000u32);
+            fund_scout(&env, &token, &scout);
+            // duration_days * LEDGERS_PER_DAY must fit in a u32 — subscribe()
+            // correctly rejects anything larger with Error::Overflow, so this
+            // needs to stay well under u32::MAX / LEDGERS_PER_DAY (~248 000).
+            sub.subscribe(&scout, &1u32, &100_000u32);
 
             let mut min_levels = vec![0u32; 3];
 

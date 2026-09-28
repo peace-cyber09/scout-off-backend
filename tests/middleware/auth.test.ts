@@ -241,6 +241,38 @@ describe('requireRole', () => {
   });
 });
 
+describe('token rejection matrix (#1220)', () => {
+  const revokedJti = 'test-jti-matrix-revoked';
+  const revokedToken = jwt.sign({ sub: 'GTEST', role: 'player', jti: revokedJti }, SECRET, { expiresIn: '1h' });
+
+  it.each([
+    ['missing token', undefined, 'Missing auth token'],
+    ['malformed token', 'not.a.valid.token', 'Invalid or expired token'],
+    ['expired token', sign({ sub: 'GTEST' }, SECRET, -1), 'Invalid or expired token'],
+    ['wrong-signature token', sign({ sub: 'GTEST' }, 'wrong-secret'), 'Invalid or expired token'],
+    ['revoked token', revokedToken, 'Token has been revoked'],
+  ])('returns 401 with the documented error for a %s', async (_label, token, expectedError) => {
+    if (token === revokedToken) {
+      jest.spyOn(tokenBlocklist, 'isTokenRevoked').mockResolvedValueOnce(true);
+    }
+    const { req, res, next } = makeReqRes(token);
+    requireAuth(req, res, next);
+    await flushPromises();
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ error: expectedError }));
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('calls next() for a valid, non-revoked token', async () => {
+    const token = sign({ sub: 'GTEST', role: 'player' });
+    const { req, res, next } = makeReqRes(token);
+    requireAuth(req, res, next);
+    await flushPromises();
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+  });
+});
+
 describe('JWT key rotation (#273)', () => {
   afterEach(() => {
     delete process.env.JWT_SECRET_PREVIOUS;

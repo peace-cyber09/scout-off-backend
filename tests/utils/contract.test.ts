@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { xdr, SorobanRpc, Account } from '@stellar/stellar-sdk';
+import { xdr, rpc, Account } from '@stellar/stellar-sdk';
 import {
   invokeContract,
   strVal,
@@ -36,8 +36,8 @@ jest.mock('@stellar/stellar-sdk', () => {
   const fakeTx = { sign: jest.fn(), toXDR: jest.fn(() => 'fake-xdr') };
   return {
     ...actual,
-    SorobanRpc: {
-      ...actual.SorobanRpc,
+    rpc: {
+      ...actual.rpc,
       assembleTransaction: jest.fn(() => ({ build: () => fakeTx })),
     },
   };
@@ -62,7 +62,7 @@ function makeSimResult() {
     },
     minResourceFee: '100',
     cost: { cpuInsns: '0', memBytes: '0' },
-    results: [{ auth: [], xdr: xdr.ScVal.scvVoid().toXDR('base64') }],
+    results: [{ auth: [], xdr: xdr.ScVal.scvVoid().toXdr('base64') }],
     _parsed: true,
   };
 }
@@ -85,7 +85,7 @@ describe('invokeContract', () => {
       error: 'wasm trap: unreachable',
       _parsed: true,
     } as any);
-    jest.spyOn(SorobanRpc.Api, 'isSimulationError').mockReturnValue(true);
+    jest.spyOn(rpc.Api, 'isSimulationError').mockReturnValue(true);
 
     await expect(invokeContract('bad_method', [])).rejects.toThrow(ContractExecutionError);
   });
@@ -100,7 +100,7 @@ describe('invokeContract', () => {
   it('throws ContractExecutionError when sendTransaction returns ERROR', async () => {
     mockServer.getAccount.mockResolvedValue(makeAccount() as any);
     mockServer.simulateTransaction.mockResolvedValue(makeSimResult() as any);
-    jest.spyOn(SorobanRpc.Api, 'isSimulationError').mockReturnValue(false);
+    jest.spyOn(rpc.Api, 'isSimulationError').mockReturnValue(false);
     // assembleTransaction needs to be skipped — mock sendTransaction to ERROR
     mockServer.sendTransaction.mockResolvedValue({ status: 'ERROR', errorResult: 'bad op', hash: '' } as any);
 
@@ -110,10 +110,10 @@ describe('invokeContract', () => {
   it('throws ContractTimeoutError when transaction never confirms within timeout', async () => {
     mockServer.getAccount.mockResolvedValue(makeAccount() as any);
     mockServer.simulateTransaction.mockResolvedValue(makeSimResult() as any);
-    jest.spyOn(SorobanRpc.Api, 'isSimulationError').mockReturnValue(false);
+    jest.spyOn(rpc.Api, 'isSimulationError').mockReturnValue(false);
     mockServer.sendTransaction.mockResolvedValue({ status: 'PENDING', hash: FAKE_HASH } as any);
     mockServer.getTransaction.mockResolvedValue({
-      status: SorobanRpc.Api.GetTransactionStatus.NOT_FOUND,
+      status: rpc.Api.GetTransactionStatus.NOT_FOUND,
     } as any);
 
     await expect(invokeContract('get_player', [], 100)).rejects.toThrow(ContractTimeoutError);
@@ -122,10 +122,10 @@ describe('invokeContract', () => {
   it('throws ContractExecutionError when transaction fails on-chain', async () => {
     mockServer.getAccount.mockResolvedValue(makeAccount() as any);
     mockServer.simulateTransaction.mockResolvedValue(makeSimResult() as any);
-    jest.spyOn(SorobanRpc.Api, 'isSimulationError').mockReturnValue(false);
+    jest.spyOn(rpc.Api, 'isSimulationError').mockReturnValue(false);
     mockServer.sendTransaction.mockResolvedValue({ status: 'PENDING', hash: FAKE_HASH } as any);
     mockServer.getTransaction.mockResolvedValue({
-      status: SorobanRpc.Api.GetTransactionStatus.FAILED,
+      status: rpc.Api.GetTransactionStatus.FAILED,
     } as any);
 
     await expect(invokeContract('get_player', [])).rejects.toThrow(ContractExecutionError);
@@ -134,10 +134,10 @@ describe('invokeContract', () => {
   it('returns hash and returnValue on success', async () => {
     mockServer.getAccount.mockResolvedValue(makeAccount() as any);
     mockServer.simulateTransaction.mockResolvedValue(makeSimResult() as any);
-    jest.spyOn(SorobanRpc.Api, 'isSimulationError').mockReturnValue(false);
+    jest.spyOn(rpc.Api, 'isSimulationError').mockReturnValue(false);
     mockServer.sendTransaction.mockResolvedValue({ status: 'PENDING', hash: FAKE_HASH } as any);
     mockServer.getTransaction.mockResolvedValue({
-      status: SorobanRpc.Api.GetTransactionStatus.SUCCESS,
+      status: rpc.Api.GetTransactionStatus.SUCCESS,
       returnValue: xdr.ScVal.scvVoid(),
     } as any);
 

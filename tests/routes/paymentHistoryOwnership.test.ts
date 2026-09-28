@@ -9,6 +9,7 @@ jest.mock('../../src/db', () => ({
   getPlayerById: jest.fn().mockReturnValue(null),
   getLatestSubscription: jest.fn().mockReturnValue(null),
   getContactUnlocksByScout: jest.fn().mockReturnValue([]),
+  getSubscriptionsByScout: jest.fn().mockReturnValue([]),
   hasContactUnlock: jest.fn().mockReturnValue(false),
 }));
 

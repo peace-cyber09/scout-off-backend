@@ -105,7 +105,7 @@ describe('Property-based Fuzzing', () => {
         fc.property(fc.uint8Array({ maxLength: 1024 }), (bytes) => {
           let val: xdr.ScVal;
           try {
-            val = xdr.ScVal.fromXDR(Buffer.from(bytes));
+            val = xdr.ScVal.fromXdr(Buffer.from(bytes));
           } catch (e) {
             // Decoding failed, which is expected for random bytes
             return;

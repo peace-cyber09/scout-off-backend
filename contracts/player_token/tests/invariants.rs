@@ -21,6 +21,17 @@ mod player_token_invariants {
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
+    /// Number of cases to run per proptest! block. Defaults to 10 000 (the
+    /// project standard) but can be overridden via PROPTEST_CASES — e.g. CI
+    /// uses a smaller value for fast PR feedback within its time budget,
+    /// while nightly/local runs keep the full 10 000.
+    fn proptest_cases() -> u32 {
+        std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000)
+    }
+
     fn setup(env: &Env) -> (PlayerTokenContractClient<'_>, Address) {
         env.mock_all_auths();
         let id = env.register_contract(None, PlayerTokenContract);
@@ -33,7 +44,7 @@ mod player_token_invariants {
     // ── T1: zero total_supply is always rejected ──────────────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         #[test]
         fn prop_issue_tokens_zero_supply_always_fails(player_id in 1u64..=1_000u64) {
@@ -47,7 +58,7 @@ mod player_token_invariants {
     // ── T2: sold never exceeds total_supply ───────────────────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// For any sequence of buy_token calls, meta.sold must always be ≤ total_supply.
         #[test]
@@ -64,7 +75,7 @@ mod player_token_invariants {
                 let buyer = Address::generate(&env);
                 let _ = client.try_buy_token(&player_id, &amount, &buyer);
 
-                let meta = client.get_token_meta(&player_id).unwrap();
+                let meta = client.get_token_meta(&player_id);
                 prop_assert!(
                     meta.sold <= meta.total_supply,
                     "sold {} exceeds total_supply {}",
@@ -77,7 +88,7 @@ mod player_token_invariants {
     // ── T3: sum of balances equals meta.sold ──────────────────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// After n distinct buyers each purchase exactly `amount` tokens, the sum of all
         /// their balances must equal meta.sold.
@@ -104,7 +115,7 @@ mod player_token_invariants {
                 .map(|b| client.get_balance(&player_id, b))
                 .sum();
 
-            let meta = client.get_token_meta(&player_id).unwrap();
+            let meta = client.get_token_meta(&player_id);
             prop_assert_eq!(
                 balance_sum, meta.sold,
                 "sum of balances {} must equal meta.sold {}",
@@ -116,7 +127,7 @@ mod player_token_invariants {
     // ── T4: distribute_fee total payouts never exceed the fee (u128::MAX range) ─
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// For any transfer_fee_xlm in [1, u128::MAX/100], total holder payouts ≤ fee.
         /// Uses 3 holders with proportions 50/30/20 to match the unit test scenario.
@@ -136,7 +147,7 @@ mod player_token_invariants {
             client.buy_token(&1u64, &30u64, &b2);
             client.buy_token(&1u64, &20u64, &b3);
 
-            let queued = client.distribute_fee(&1u64, &fee, &0u32);
+            let queued = client.distribute_fee(&1u64, &fee, &1u128, &0u32);
             prop_assert_eq!(queued, 3);
 
             let payouts = client.get_pending_payouts(&1u64, &0u32);
@@ -152,7 +163,7 @@ mod player_token_invariants {
     // ── T5: rounding — floor shares never overshoot the available fee ─────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// For any number of equal-share holders (1–20) and any fee amount, the sum
         /// of integer floor shares must be ≤ fee.
@@ -174,7 +185,7 @@ mod player_token_invariants {
                 buyers.push(b);
             }
 
-            let queued = client.distribute_fee(&player_id, &fee, &0u32);
+            let queued = client.distribute_fee(&player_id, &fee, &1u128, &0u32);
             prop_assert!(queued as usize <= n_holders);
 
             let payouts = client.get_pending_payouts(&player_id, &0u32);
@@ -190,7 +201,7 @@ mod player_token_invariants {
     // ── T6: buyer balance is monotonically non-decreasing ─────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// Successive purchases by the same buyer must always increase or maintain
         /// (never decrease) their stored balance.
@@ -222,7 +233,7 @@ mod player_token_invariants {
     // ── T7: unknown holder returns balance 0 ─────────────────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         #[test]
         fn prop_unknown_holder_balance_is_zero(
@@ -239,7 +250,7 @@ mod player_token_invariants {
     // ── T8: out-of-range page returns 0 queued ────────────────────────────────
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(10_000))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         /// Requesting a page whose start index exceeds holder count must return 0.
         #[test]
@@ -257,7 +268,7 @@ mod player_token_invariants {
                 client.buy_token(&player_id, &5u64, &b);
             }
 
-            let queued = client.distribute_fee(&player_id, &1_000u128, &page);
+            let queued = client.distribute_fee(&player_id, &1_000u128, &1u128, &page);
             prop_assert_eq!(queued, 0, "page {} beyond holder count must return 0 queued", page);
         }
     }

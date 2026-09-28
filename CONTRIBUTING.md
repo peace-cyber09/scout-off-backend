@@ -1,11 +1,12 @@
 # Contributing to ScoutOff Backend
 
-Welcome! This guide covers contribution workflows, code standards, and critical security practices including dependency management.
+Welcome! This guide covers contribution workflows, code standards, and critical security practices including dependency management. All participants are expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Table of Contents
 
 - [Getting Started](#getting-started)
 - [Seeding the Database](#seeding-the-database)
+- [Choosing an Issue](#choosing-an-issue)
 - [Contribution Workflow](#contribution-workflow)
 - [Code Quality Standards](#code-quality-standards)
 - [Security & Dependency Review](#security--dependency-review)
@@ -17,14 +18,14 @@ Welcome! This guide covers contribution workflows, code standards, and critical 
 
 ### Prerequisites
 
-- Node.js — supported range is `>=18.0.0 <23.0.0` (see `engines.node` in [`package.json`](package.json)). [`.nvmrc`](.nvmrc) pins the version used for local dev and for the primary CI coverage upload (currently Node 20)
+- Node.js — supported range is `>=22.0.0 <25.0.0` (see `engines.node` in [`package.json`](package.json)). [`.nvmrc`](.nvmrc) pins the version used for local dev and for the primary CI coverage upload (currently Node 22). The floor is Node 22 because `@stellar/stellar-sdk` (via `@stellar/js-xdr`) requires it.
   - If you use **nvm**: `nvm install && nvm use` (reads `.nvmrc` automatically)
   - If you use **fnm**: `fnm install && fnm use`
   - If you use **asdf**: `asdf install nodejs` (reads `.nvmrc` via the Node.js plugin)
-- npm ≥ 9
+- npm ≥ 10
 - Git
 
-> CI's `lint` and `test` jobs run across a matrix of Node 18, 20, and 22 (`.github/workflows/ci.yml`) so a regression that only manifests on one supported version is caught before merge. `.nvmrc` remains the default for local dev; bump `engines.node` in `package.json` alongside the CI matrix if the supported range changes.
+> CI's `lint` and `test` jobs run across a matrix of Node 22 and 24 (`.github/workflows/ci.yml`) so a regression that only manifests on one supported version is caught before merge. `.nvmrc` remains the default for local dev; bump `engines.node` in `package.json` alongside the CI matrix if the supported range changes.
 
 ### Setup
 
@@ -47,6 +48,56 @@ Welcome! This guide covers contribution workflows, code standards, and critical 
    - Linting passes: `npm run lint`
    - No security vulnerabilities: `npm audit`
    - Environment is set up: `cp .env.example .env`
+
+### Database Migrations
+
+The project uses SQL migrations to manage database schema across environments. Migrations are stored as numbered `.sql` files in the `db/` directory and are tracked in the `migrations` table. See [db/README.md](db/README.md) for the naming convention, SQLite/PostgreSQL pairing, and how to add a new migration.
+
+**Checking migration status:**
+
+To see which migrations have been applied to your current database and which are pending:
+
+```bash
+npm run migration:status
+```
+
+This command is read-only and does not modify the database. It queries the `migrations` table to determine which schema changes have been applied.
+
+**Example output:**
+
+```
+Migration Status Report
+═════════════════════════════════════════════════════════════════════
+
+Status: 7 applied, 2 pending
+
+┌──────────────────────────────────┬───────────┬──────────────────────┐
+│ Migration                        │ Status    │ Applied At           │
+├──────────────────────────────────┼───────────┼──────────────────────┤
+│ 001_initial.sql                  │ ✓ Applied │ 2024-01-15 10:23:45  │
+│ 002_audit_log.sql                │ ✓ Applied │ 2024-01-15 10:23:46  │
+│ 003_idempotency_keys.sql         │ ✓ Applied │ 2024-01-15 10:23:48  │
+│ 004_token_revocation.sql         │ ⧬ Pending │ —                    │
+│ 004_validators.sql               │ ⧬ Pending │ —                    │
+└──────────────────────────────────┴───────────┴──────────────────────┘
+```
+
+**Understanding the output:**
+
+- **Status: X applied, Y pending**: Summary line showing how many migrations have been applied and how many are awaiting execution
+- **✓ Applied**: Migration has been executed and is recorded in the `migrations` table
+- **⧬ Pending**: Migration file exists but has not been applied yet
+- **Applied At**: Timestamp (ISO 8601 format) when the migration was applied, or "—" for pending migrations
+
+**Applying pending migrations:**
+
+To apply all pending migrations, use:
+
+```bash
+npm run seed
+```
+
+This runs the migration system, which automatically applies any pending migrations found in the `db/` directory in alphabetical order.
 
 ## Seeding the Database
 
@@ -139,6 +190,28 @@ rm scout-off.db   # or whatever DB_PATH points at in your .env
 npm run seed
 ```
 
+## Understanding the Data Model
+
+Before writing queries or modifying data flows, consult **[`docs/data-model.md`](docs/data-model.md)** to understand:
+- Which table is authoritative for a given concept
+- Whether data is populated by the indexer (on-chain mirror) or direct API writes
+- The relationships between chain-mirror tables and API-owned tables
+- Hybrid tables that receive writes from both sources
+
+This prevents writing queries against the wrong table or misunderstanding where data originates.
+
+## Choosing an Issue
+
+All open issues carry a `difficulty` label — `easy`, `medium`, or `hard` — assigned by maintainers during triage. Use these labels to find work that matches your current experience level with the codebase.
+
+- **`difficulty: easy`** — Self-contained changes usually limited to a single file or module. No deep knowledge of the codebase, Stellar, or Soroban is required. Typical examples: fixing a typo in docs, adding a missing test case, adding a small helper function, or updating a configuration value. **If this is your first contribution, start here.** Issues tagged `good first issue` are always `easy` — the `good first issue` label is a subset of `easy` issues that maintainers consider especially well-scoped and well-documented for a newcomer.
+
+- **`difficulty: medium`** — Requires understanding two or more modules, or involves a non-trivial design or data-model decision. Some prior exposure to the project is helpful. Typical examples: adding a new API route with input validation, extending the indexer to handle a new event type, or improving test coverage across a feature area.
+
+- **`difficulty: hard`** — Spans multiple layers of the stack (Soroban contract + backend + docs), requires deep domain knowledge (SEP-10, Stellar transaction semantics, or security-sensitive flows), or has meaningful performance implications. Typical examples: implementing the pay-to-contact flow end-to-end, introducing distributed caching, or hardening auth middleware against timing attacks.
+
+> **Tip:** After claiming an `easy` or `medium` issue, it's fine to open a draft PR early and ask questions in the comments — maintainers are happy to give design feedback before you invest too much time.
+
 ## Contribution Workflow
 
 ### 1. Claim an Issue
@@ -148,10 +221,12 @@ Comment on the GitHub issue to indicate you're working on it. Maintainers will a
 ### 2. Make Changes and Test
 
 ```bash
-npm run dev           # Start dev server with hot-reload
-npm run test          # Run full test suite
-npm run lint          # Check code style
-npm audit             # Check for security vulnerabilities
+npm run dev                  # Start dev server with hot-reload
+npm run test                 # Run full test suite
+npm run lint                 # Check code style
+npm run typecheck            # Fast type-check (tsc --noEmit), no build output
+npm run check:sql-injection  # Scan src/db for unsafe SQL string interpolation
+npm audit                    # Check for security vulnerabilities
 ```
 
 ### 3. Commit with Clear Messages
@@ -253,6 +328,11 @@ npx lint-staged
 - **Linting**: No linting warnings
   ```bash
   npm run lint
+  ```
+
+- **SQL Injection Check**: `src/db/*.ts` must not splice values into SQL via string interpolation; use parameterized `?` placeholders instead
+  ```bash
+  npm run check:sql-injection
   ```
 
 - **Types**: Use strict TypeScript; avoid `any` types where possible
@@ -517,11 +597,23 @@ wait for maintainer confirmation.
 Difficulty labels help new contributors find issues that match their experience
 level. They are assigned by maintainers at triage time, not by the reporter.
 
-| Label | Description |
-|-------|-------------|
-| `easy` | Self-contained change in a single file or module. No deep knowledge of the codebase or Stellar/Soroban required. Good first issues. Examples: add a missing test case, fix a typo in docs, add a helper function. |
-| `medium` | Requires understanding two or more modules, or involves a non-trivial algorithm / data-model change. Some prior exposure to the project is helpful. Examples: extend the indexer to handle a new event type, add a new API route with validation. |
-| `hard` | Spans multiple layers of the stack (contract + backend + docs), requires deep domain knowledge (Soroban, SEP-10), or has significant performance or security implications. Examples: implement pay-to-contact flow end-to-end; introduce distributed caching; harden auth middleware against timing attacks. |
+The repo uses two label naming conventions. The **canonical** set uses the
+`difficulty:` prefix (`difficulty: easy`, `difficulty: medium`,
+`difficulty: hard`). Bare labels without the prefix (`easy`, `medium`,
+`hard`) are legacy aliases and are gradually being migrated to the prefixed
+form. When filtering by difficulty, use the prefixed labels for the most
+complete results.
+
+An additional `difficulty: extreme` label exists for issues that require
+deep, cross-cutting architectural changes — these go beyond `hard` in scope
+or risk and are typically reserved for core contributors.
+
+| Label | Canonical form | Description |
+|-------|---------------|-------------|
+| Easy | `difficulty: easy` | Self-contained change in a single file or module. No deep knowledge of the codebase or Stellar/Soroban required. Good first issues. Examples: add a missing test case, fix a typo in docs, add a helper function. |
+| Medium | `difficulty: medium` | Requires understanding two or more modules, or involves a non-trivial algorithm / data-model change. Some prior exposure to the project is helpful. Examples: extend the indexer to handle a new event type, add a new API route with validation. |
+| Hard | `difficulty: hard` | Spans multiple layers of the stack (contract + backend + docs), requires deep domain knowledge (Soroban, SEP-10), or has significant performance or security implications. Examples: implement pay-to-contact flow end-to-end; introduce distributed caching; harden auth middleware against timing attacks. |
+| Extreme | `difficulty: extreme` | Cross-cutting architectural changes spanning most of the stack. Reserved for core contributors with deep domain expertise. These issues are rare and typically require design discussion before implementation begins. |
 
 ---
 
@@ -629,3 +721,6 @@ ScoutOff is part of the Drips funding wave program. Funded contributors receive 
 ---
 
 **Thank you for contributing to ScoutOff!** Your work helps connect talented footballers with opportunities. 🙌
+
+SHA: 22d84cc3bd4ad4e2b033604e4dfc3ac8ee365919
+MATCH: True

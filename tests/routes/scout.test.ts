@@ -355,14 +355,46 @@ describe('POST /api/scouts/:wallet/contacts/:playerId/unlock', () => {
   });
 
   it('proceeds with unlock when JWT wallet matches path wallet', async () => {
-    mockSubmitContactPayment.mockResolvedValue({ txHash: 'abc123', fee: '1' });
+    mockGetPlayerById.mockReturnValue({
+      player_id: PLAYER_ID,
+      wallet: 'GPLAYERWALLET1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      metadata_uri: 'ipfs://QmContactMetadata',
+    });
+    mockSubmitContactPayment.mockResolvedValue({ transactionId: 'abc123', status: 'submitted' });
     const token = makeToken(WALLET);
     const res = await request(app)
       .post(`/api/scouts/${WALLET}/contacts/${PLAYER_ID}/unlock`)
       .set('Authorization', `Bearer ${token}`);
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
+    expect(res.body.data.transactionId).toBe('abc123');
     expect(mockSubmitContactPayment).toHaveBeenCalledWith(WALLET, PLAYER_ID);
+  });
+
+  it('returns 404 when the player does not exist', async () => {
+    mockGetPlayerById.mockReturnValue(null);
+    const token = makeToken(WALLET);
+    const res = await request(app)
+      .post(`/api/scouts/${WALLET}/contacts/${PLAYER_ID}/unlock`)
+      .set('Authorization', `Bearer ${token}`);
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ success: false, code: 'PLAYER_NOT_FOUND' });
+    expect(mockSubmitContactPayment).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when a scout tries to unlock their own profile', async () => {
+    mockGetPlayerById.mockReturnValue({
+      player_id: PLAYER_ID,
+      wallet: WALLET,
+      metadata_uri: 'ipfs://QmContactMetadata',
+    });
+    const token = makeToken(WALLET);
+    const res = await request(app)
+      .post(`/api/scouts/${WALLET}/contacts/${PLAYER_ID}/unlock`)
+      .set('Authorization', `Bearer ${token}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/own profile/i);
+    expect(mockSubmitContactPayment).not.toHaveBeenCalled();
   });
 });
 
@@ -541,7 +573,10 @@ describe('GET /api/scouts/:wallet/contacts/:playerId', () => {
   });
 
   it('returns player contact details on success', async () => {
-    mockGetPlayerById.mockReturnValue(MOCK_PLAYER);
+    mockGetPlayerById.mockReturnValue({
+      ...MOCK_PLAYER,
+      metadata_uri: 'ipfs://QmContactMetadata',
+    });
     mockHasContactUnlock.mockReturnValue(true);
     const token = makeToken(WALLET);
     const res = await request(app)
@@ -552,8 +587,7 @@ describe('GET /api/scouts/:wallet/contacts/:playerId', () => {
     expect(res.body.data).toEqual({
       playerId: PLAYER_ID,
       wallet: MOCK_PLAYER.wallet,
-      email: `${PLAYER_ID}@example.com`,
-      phone: '+1-555-0199',
+      metadataUri: 'ipfs://QmContactMetadata',
     });
   });
 });

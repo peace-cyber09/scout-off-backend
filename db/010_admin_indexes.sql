@@ -21,6 +21,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_milestones_player ON pending_milestones (
 
 -- New composite indexes for query optimization
 CREATE INDEX IF NOT EXISTS idx_events_type_ledger ON events (type, ledger);
+CREATE INDEX IF NOT EXISTS idx_events_created_at ON events (created_at);
 CREATE INDEX IF NOT EXISTS idx_subscriptions_scout_cancelled_expires ON subscriptions (scout_wallet, cancelled_at, expires_at);
 CREATE INDEX IF NOT EXISTS idx_audit_action_created_at ON audit_log (action, created_at);
 CREATE INDEX IF NOT EXISTS idx_pending_milestones_validator_submitted_at ON pending_milestones (validator_wallet, submitted_at);

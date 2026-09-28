@@ -22,6 +22,7 @@ Stellar is the backbone: sub-cent transaction fees mean a scout in Europe can pa
 - **Subscription Model**: Scouts can hold an active subscription for unlimited browsing within a tier
 - **SEP-10 Auth**: Players and scouts log in securely with a Stellar wallet (Freighter, Albedo, or Lobstr)
 - **Auth docs**: See docs/auth.md for SEP-10 challenge flow, JWT lifecycle, token refresh, and example requests.
+- **GraphQL docs**: See [docs/graphql.md](docs/graphql.md) for the read-only GraphQL endpoint, schema, limits, and authentication.
 - **Decentralized Storage**: Highlight reels and photos stored on IPFS; content hashes saved on-chain in the player's profile
 
 ## Architecture
@@ -286,6 +287,8 @@ nvm use
 npm install
 ```
 
+> **Troubleshooting:** `.npmrc` sets `engines-strict=true`, so `npm install` fails immediately with an `engines` error on an unsupported Node/npm version instead of just warning — run `nvm use` (or install a Node version matching `engines.node` in `package.json`) and re-run `npm install`.
+
 ### 2. Build Smart Contracts
 
 ```bash
@@ -449,7 +452,7 @@ This section covers everything you need to get the backend running locally.
 
 ### Prerequisites
 
-- Node.js ≥ 18 (the exact version this project targets is pinned in [`.nvmrc`](.nvmrc); run `nvm use` if you use [nvm](https://github.com/nvm-sh/nvm))
+- Node.js ≥ 22 (the exact version this project targets is pinned in [`.nvmrc`](.nvmrc); run `nvm use` if you use [nvm](https://github.com/nvm-sh/nvm))
 - npm ≥ 9
 
 ### Install Dependencies
@@ -460,6 +463,8 @@ npm install
 ```
 
 ### Environment Setup
+
+> Hit an error during setup? See [Troubleshooting local setup](#troubleshooting-local-setup) for common fixes.
 
 Copy the example env file and fill in the required values:
 
@@ -484,6 +489,7 @@ Optional but commonly set:
 | `PINATA_API_KEY` / `PINATA_SECRET` | —               | IPFS upload credentials                         |
 | `DB_PATH`                          | `scout-off.db`  | SQLite database file path                       |
 | `LOG_LEVEL`                        | `info`          | Log verbosity: `debug`, `info`, `warn`, `error` |
+| `SLOW_QUERY_THRESHOLD_MS`          | `50`            | Log a warning for DB queries slower than this (ms) |
 
 See [.env.example](.env.example) for the full list of supported variables.
 
@@ -599,6 +605,15 @@ curl http://localhost:4000/api/players/seed-player-003
 ```bash
 npm run lint
 ```
+
+### Troubleshooting local setup
+
+| Error text | Cause | Fix |
+| ---------- | ----- | --- |
+| `Error: Missing required environment variable: JWT_SECRET` (or `CONTRACT_ID`) | `src/config.ts` calls `required(...)` for these vars and throws on startup if they're unset. `predev`/`prestart` also run `scripts/validate-env.js --runtime`, which fails fast with the same error. | Copy `.env.example` to `.env` and fill in `JWT_SECRET` and `CONTRACT_ID` (see [Environment Setup](#environment-setup)). |
+| `Error: Cannot find module '../build/Release/better_sqlite3.node'` or a native binding / ABI mismatch error on `npm install` / `npm run dev` / startup | `better-sqlite3` ships a native addon compiled against a specific Node ABI. Installing with one Node version then running with another (or a stale Docker layer) leaves a binary that does not match the running process. Startup now throws a single `BetterSqlite3LoadError` naming the detected Node version, the ABI mismatch, and the rebuild command. | Run `nvm use` (Node `22.x` — see `.nvmrc` / `package.json` `engines`), then `npm rebuild better-sqlite3`. If that still fails: `rm -rf node_modules && npm install`. In Docker/CI, ensure the image Node major matches `engines.node` and that native modules are rebuilt in the same stage that runs the app (do not copy `node_modules` across different Node bases). |
+| `The engine "node" is incompatible with this module` (npm) or unexpected runtime errors on an unsupported Node version | The project's `engines.node` in `package.json` is `>=22.0.0 <25.0.0`, and `.nvmrc` pins the exact version used in CI's primary coverage job. | Install the pinned version with `nvm install && nvm use` (or the equivalent for fnm/asdf) before running `npm install`. |
+| `validate-env` fails during `npm install`/`npm run dev`/`npm start` (`predev`/`prestart` hooks) listing missing or unrecognised env vars | `scripts/validate-env.js --runtime` checks that every required var is set and that `NODE_ENV`/`DB_DRIVER`/`PINATA_GATEWAY` (when set) have valid values. | Read the specific error line — it names the offending variable — and fix it in `.env`. Run `node scripts/validate-env.js` (without `--runtime`) to also check that `.env.example` documents every var referenced in `src/`. |
 
 ## Health Endpoints
 
@@ -749,6 +764,20 @@ In **production** (`NODE_ENV=production`) the same functions throw immediately i
    - Admin monitors platform fees and calls `withdraw_fees` to collect revenue
    - Emergency `pause_contract` available as a circuit breaker
 
+## Documentation
+
+The backend's guides live in [`docs/`](docs/README.md), indexed by topic:
+
+- [docs/README.md](docs/README.md) — index of every doc in `docs/`
+- [docs/auth.md](docs/auth.md) — SEP-10 authentication, JWT lifecycle, API keys, SSE revocation
+- [docs/events.md](docs/events.md) — SSE event stream: connecting, filtering, frame format, reconnection limits
+- [docs/webhooks.md](docs/webhooks.md) — outbound webhooks, signatures, dead-letter queue, replay
+- [docs/ip-reputation.md](docs/ip-reputation.md) — IP reputation scoring and admin whitelist/blacklist controls
+- [docs/runbook.md](docs/runbook.md) — operator runbook: indexer lag, reindex/replay, dead-letter drain, cache flush, circuit breaker, pause/unpause
+- [docs/performance.md](docs/performance.md) — latency budgets and load-testing
+
+Operator topics (secrets rotation, data privacy, Postgres migration, deployment) are listed in the index and in [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## Configuration
 
 ### Key Environment Variables
@@ -780,6 +809,7 @@ In **production** (`NODE_ENV=production`) the same functions throw immediately i
 | `ADMIN_THRESHOLD`                 | Number of admin signatures required for high-value operations (default: `1`)                                          |
 | `STELLAR_HEALTH_CHECK`            | Set to `false` to disable Stellar RPC check in `/health` (default: `true`)                                            |
 | `JSON_PAYLOAD_LIMIT`              | Maximum JSON request body size (default: `1mb`); requests exceeding limit return HTTP 413                             |
+| `UPLOAD_PAYLOAD_LIMIT`            | Max JSON body for upload endpoints — player registration and milestone evidence (default: `10mb`)                     |
 | `RATE_LIMIT_ENABLED`              | Set to `false` to disable rate limiting (default: `true`)                                                             |
 | `RATE_LIMIT_WINDOW_MS`            | Rate limit window in milliseconds (default: `60000`)                                                                  |
 | `RATE_LIMIT_MAX`                  | Max requests per window (default: `60`)                                                                               |
@@ -790,14 +820,19 @@ In **production** (`NODE_ENV=production`) the same functions throw immediately i
 | `WEBHOOK_ENABLED`                 | Set to `true` to enable event webhooks (default: `false`)                                                             |
 | `WEBHOOK_URL`                     | Endpoint to POST contract events to when `WEBHOOK_ENABLED=true`                                                       |
 | `WEBHOOK_SECRET`                  | HMAC secret for the legacy `WEBHOOK_URL` subscription (see `docs/webhooks.md`); a random secret is generated if unset |
+| `WEBHOOK_TIMEOUT_MS`              | Per-attempt timeout for outbound webhook deliveries in milliseconds (default: `10000`)                                |
 | `REDIS_URL`                       | Redis connection URL for distributed caching (falls back to in-memory if unset)                                       |
 | `PLAYER_CACHE_TTL_MS`             | TTL for player list cache entries in milliseconds (default: `60000`)                                                  |
 | `PLAYER_IMPORT_MAX_BATCH`         | Maximum rows per bulk player import request (default: `500`)                                                          |
 | `PIN_JSON_CACHE_TTL_MS`           | TTL for pinJson deduplication cache entries in milliseconds (default: `300000` = 5 min)                               |
 | `ADMIN_ACTION_TTL_MS`             | TTL for pending admin multi-sig actions in milliseconds (default: `3600000` = 1 hour)                                 |
 | `SUBSCRIPTION_GRACE_PERIOD_HOURS` | Grace period after subscription expiry during which access is still granted (default: `24`)                           |
+| `TRIAL_OFFER_TTL_MS`              | How long a trial offer remains open for accept/reject, in milliseconds (default: `2592000000` = 30 days). Set to `0` to disable expiry. |
 | `REQUEST_TIMEOUT_MS`              | Global request timeout in milliseconds before responding with 503 (default: `30000`)                                  |
+| `IPFS_HTTP_TIMEOUT_MS`            | Per-request HTTP timeout for Pinata/IPFS axios calls in milliseconds (default: `15000`)                               |
+| `STELLAR_RPC_TIMEOUT_MS`          | Per-request HTTP timeout for Soroban RPC / Stellar SDK calls in milliseconds (default: `15000`)                       |
 | `ADMIN_IP_ALLOWLIST`              | Comma-separated list of IPv4 addresses/CIDRs allowed on admin routes (unset = allow all)                              |
+| `SLOW_QUERY_THRESHOLD_MS`         | Log a structured warning for DB queries slower than this, in milliseconds (default: `50`)                             |
 | `SSE_KEEPALIVE_INTERVAL_MS`       | Interval in milliseconds to send SSE keep-alive comments (default: `15000` = 15 seconds)                              |
 | `SSE_MAX_CONNECTIONS`             | Maximum number of concurrent SSE connections (default: `0` = unlimited)                                               |
 
@@ -901,7 +936,7 @@ MIT
 
 ## Contributing
 
-Contributions are welcome! This section provides guidance for backend contributors and issue filing best practices.
+Contributions are welcome! This section provides guidance for backend contributors and issue filing best practices. All participants are expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ### Getting Started
 

@@ -10,7 +10,7 @@ import {
 const SECRET = process.env.JWT_SECRET ?? 'test-secret';
 
 jest.mock('../../src/services/audit', () => ({
-  logAuditEvent: jest.fn(),
+  logAuditEvent: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../../src/services/stellar', () => ({

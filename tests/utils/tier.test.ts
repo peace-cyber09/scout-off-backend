@@ -12,10 +12,16 @@ describe('getTierMeta', () => {
     expect(meta.tierDescription.length).toBeGreaterThan(0);
   });
 
-  it('uses localization key format for future i18n', () => {
-    const meta = getTierMeta(0);
-    expect(meta.tierName).toMatch(/^tier\.\d+\./);
-    expect(meta.tierDescription).toMatch(/^tier\.\d+\./);
+  it('uses canonical tier names matching docs/tier-promotion.md', () => {
+    expect(getTierMeta(0).tierName).toBe('Unverified');
+    expect(getTierMeta(1).tierName).toBe('Emerging');
+    expect(getTierMeta(2).tierName).toBe('Established');
+    expect(getTierMeta(3).tierName).toBe('Elite');
+  });
+
+  it('returns fallback for unknown level', () => {
+    const meta = getTierMeta(99);
+    expect(meta.tierName).toBe('Unknown');
   });
 });
 

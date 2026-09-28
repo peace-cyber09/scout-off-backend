@@ -16,9 +16,22 @@
  */
 
 import Redis from 'ioredis';
+import { EventEmitter } from 'events';
 import config from '../config';
 import { logger } from '../utils/logger';
 import { getDriver } from '../db';
+
+// ─── In-process revocation events ────────────────────────────────────────────
+//
+// SSE connections subscribe here (via onTokenRevoked) so a token revoked in
+// this process terminates the matching established streams immediately.
+// Revocations persisted by another instance are picked up by the SSE route's
+// bounded DB sweep (getActiveRevokedJtis) — see docs/auth.md.
+
+const revokedEmitter = new EventEmitter();
+revokedEmitter.setMaxListeners(0); // one listener per SSE connection
+
+const REVOKED_EVENT = 'token_revoked';
 
 // ─── Redis client (optional) ──────────────────────────────────────────────────
 
@@ -49,11 +62,11 @@ function redisKey(jti: string): string {
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
 /** Delete all DB rows that have already expired. */
-function pruneExpiredTokens(): void {
+async function pruneExpiredTokens(): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   try {
     const driver = getDriver();
-    driver.run('DELETE FROM revoked_tokens WHERE expires_at <= ?', [now]);
+    await driver.run('DELETE FROM revoked_tokens WHERE expires_at <= ?', [now]);
   } catch (err) {
     // DB may not be initialised yet during module load — suppress quietly;
     // the next scheduled run will succeed.
@@ -98,11 +111,11 @@ async function checkRedis(jti: string): Promise<boolean | null> {
 
 // ─── DB helpers ───────────────────────────────────────────────────────────────
 
-function writeToDb(jti: string, expiresAt: number): void {
+async function writeToDb(jti: string, expiresAt: number): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   try {
     const driver = getDriver();
-    driver.run(
+    await driver.run(
       'INSERT INTO revoked_tokens (jti, revoked_at, expires_at) VALUES (?, ?, ?) ON CONFLICT(jti) DO NOTHING',
       [jti, now, expiresAt],
     );
@@ -112,12 +125,12 @@ function writeToDb(jti: string, expiresAt: number): void {
   }
 }
 
-function checkDb(jti: string): boolean {
+async function checkDb(jti: string): Promise<boolean> {
   const now = Math.floor(Date.now() / 1000);
   try {
     const driver = getDriver();
     // Only match rows that haven't expired yet (belt-and-suspenders beyond pruning)
-    const row = driver.get<{ jti: string }>(
+    const row = await driver.get<{ jti: string }>(
       'SELECT jti FROM revoked_tokens WHERE jti = ? AND expires_at > ? LIMIT 1',
       [jti, now],
     );
@@ -146,7 +159,7 @@ async function syncDbToRedis(): Promise<void> {
 
   try {
     const driver = getDriver();
-    rows = driver.all<{ jti: string; expires_at: number }>(
+    rows = await driver.all<{ jti: string; expires_at: number }>(
       'SELECT jti, expires_at FROM revoked_tokens WHERE expires_at > ?',
       [now],
     );
@@ -175,8 +188,14 @@ async function syncDbToRedis(): Promise<void> {
  * Must be called once at application startup (after initDb()).
  */
 export function initBlocklist(): void {
-  pruneExpiredTokens();
-  setInterval(pruneExpiredTokens, PRUNE_INTERVAL_MS).unref();
+  pruneExpiredTokens().catch((err) =>
+    logger.warn('[tokenBlocklist] initial prune failed:', err),
+  );
+  setInterval(() => {
+    pruneExpiredTokens().catch((err) =>
+      logger.warn('[tokenBlocklist] scheduled prune failed:', err),
+    );
+  }, PRUNE_INTERVAL_MS).unref();
 
   // Kick off startup sync without blocking startup
   syncDbToRedis().catch((err) =>
@@ -196,12 +215,48 @@ export function initBlocklist(): void {
  */
 export async function revokeToken(jti: string, expiresAt: number): Promise<void> {
   // DB write first — it's the durable store
-  writeToDb(jti, expiresAt);
+  await writeToDb(jti, expiresAt);
 
   // Redis write — best-effort; warn on failure but never throw
   const redisOk = await writeToRedis(jti, expiresAt);
   if (!redisOk && redisClient) {
     logger.warn(`[tokenBlocklist] Redis write failed for jti=${jti}; token is blocked via DB only`);
+  }
+
+  // Notify in-process subscribers (SSE connections) synchronously.
+  revokedEmitter.emit(REVOKED_EVENT, jti);
+}
+
+/**
+ * Subscribe to in-process token revocations. The callback fires with the
+ * revoked jti whenever revokeToken() runs in this process. Returns an
+ * unsubscribe function.
+ */
+export function onTokenRevoked(cb: (jti: string) => void): () => void {
+  revokedEmitter.on(REVOKED_EVENT, cb);
+  return () => {
+    revokedEmitter.off(REVOKED_EVENT, cb);
+  };
+}
+
+/**
+ * Return every currently non-expired revoked jti (single DB query).
+ * Used by the SSE route's bounded sweep so revocations that happened in
+ * another process are detected within the documented sweep interval.
+ * Returns an empty list when the store is unavailable.
+ */
+export async function getActiveRevokedJtis(): Promise<string[]> {
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    const driver = getDriver();
+    const rows = await driver.all<{ jti: string }>(
+      'SELECT jti FROM revoked_tokens WHERE expires_at > ?',
+      [now],
+    );
+    return rows.map((r) => r.jti);
+  } catch (err) {
+    logger.warn('[tokenBlocklist] active-jti sweep query failed:', err);
+    return [];
   }
 }
 

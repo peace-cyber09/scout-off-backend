@@ -2,6 +2,7 @@ import request from 'supertest';
 import app from '../../src/app';
 import { Keypair, Transaction, Networks } from '@stellar/stellar-sdk';
 import { insertTrialOffer, getTrialOffers } from '../../src/services/indexer';
+import { getDb, insertContactUnlock } from '../../src/db';
 
 // Mock invokeContract so tests don't hit real Soroban
 jest.mock('../../src/utils/contract', () => ({
@@ -13,26 +14,47 @@ jest.mock('../../src/utils/contract', () => ({
   strVal: jest.fn((s: string) => s),
 }));
 
+// POST /trial-offers submits the offer via stellar.logTrialOffer() directly
+// (a real Soroban simulate/sign/send round-trip), not via utils/contract —
+// mock that plus isSubscribed() (scoutHasPlayerAccess's on-chain check, which
+// also round-trips to Soroban and throws in this offline test env since the
+// subscription contract instance was never deployed/initialized here) so the
+// route stays deterministic and offline. Everything else in the module —
+// getLatestSubscription, hasContactUnlock's callers, etc. — stays real.
+jest.mock('../../src/services/stellar', () => ({
+  ...jest.requireActual('../../src/services/stellar'),
+  isSubscribed: jest.fn().mockResolvedValue({ active: false, expiresAt: null }),
+  logTrialOffer: jest.fn().mockResolvedValue({
+    transactionId: 'mock-tx-hash-trial-offer-test',
+    playerId: 'player-99',
+    detailsUri: 'ipfs://QmPost',
+    playerTier: 0,
+  }),
+}));
+
+const SCOUT_KEYPAIR = Keypair.random();
+const SCOUT_WALLET = SCOUT_KEYPAIR.publicKey();
+
+// Mints a token for SCOUT_WALLET specifically — POST /trial-offers checks
+// req.account === req.params.wallet, so the signing keypair must match the
+// wallet used in the URL for the request to be treated as the offer's owner.
 async function getScoutToken(): Promise<string> {
-  const kp = Keypair.random();
-  const challengeRes = await request(app).get(`/auth/challenge?account=${kp.publicKey()}`);
+  const challengeRes = await request(app).get(`/auth/challenge?account=${SCOUT_WALLET}`);
   const tx = new Transaction(challengeRes.body.challenge, Networks.TESTNET);
-  tx.sign(kp);
+  tx.sign(SCOUT_KEYPAIR);
   const tokenRes = await request(app)
     .post('/auth/token')
-    .send({ transaction: tx.toXDR(), role: 'scout' });
+    .send({ transaction: tx.toXdr(), role: 'scout' });
   return tokenRes.body.token;
 }
 
-const SCOUT_WALLET = 'GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN';
-
 describe('#285 trial_offers', () => {
   describe('insertTrialOffer + getTrialOffers (DB layer)', () => {
-    it('persists an offer and retrieves it by scout wallet', () => {
+    it('persists an offer and retrieves it by scout wallet', async () => {
       const now = Math.floor(Date.now() / 1000);
-      insertTrialOffer(SCOUT_WALLET, 'player-1', 'ipfs://QmTest', 'tx-hash-1', now);
+      await insertTrialOffer(SCOUT_WALLET, 'player-1', 'ipfs://QmTest', 'tx-hash-1', now);
 
-      const offers = getTrialOffers(SCOUT_WALLET);
+      const offers = await getTrialOffers(SCOUT_WALLET);
       expect(offers.length).toBeGreaterThanOrEqual(1);
 
       const offer = offers.find((o) => o.tx_hash === 'tx-hash-1');
@@ -43,12 +65,12 @@ describe('#285 trial_offers', () => {
       expect(offer!.created_at).toBe(now);
     });
 
-    it('does not insert duplicate tx_hash', () => {
+    it('does not insert duplicate tx_hash', async () => {
       const now = Math.floor(Date.now() / 1000);
-      insertTrialOffer(SCOUT_WALLET, 'player-2', 'ipfs://QmDup', 'tx-dup', now);
-      insertTrialOffer(SCOUT_WALLET, 'player-2', 'ipfs://QmDup', 'tx-dup', now);
+      await insertTrialOffer(SCOUT_WALLET, 'player-2', 'ipfs://QmDup', 'tx-dup', now);
+      await insertTrialOffer(SCOUT_WALLET, 'player-2', 'ipfs://QmDup', 'tx-dup', now);
 
-      const offers = getTrialOffers(SCOUT_WALLET).filter((o) => o.tx_hash === 'tx-dup');
+      const offers = (await getTrialOffers(SCOUT_WALLET)).filter((o) => o.tx_hash === 'tx-dup');
       expect(offers.length).toBe(1);
     });
   });
@@ -61,7 +83,7 @@ describe('#285 trial_offers', () => {
 
     it('returns offer list for authenticated scout', async () => {
       // Pre-seed an offer
-      insertTrialOffer(SCOUT_WALLET, 'player-3', 'ipfs://QmGet', 'tx-get-test', Math.floor(Date.now() / 1000));
+      await insertTrialOffer(SCOUT_WALLET, 'player-3', 'ipfs://QmGet', 'tx-get-test', Math.floor(Date.now() / 1000));
 
       const token = await getScoutToken();
       const res = await request(app)
@@ -92,6 +114,29 @@ describe('#285 trial_offers', () => {
     });
 
     it('inserts offer and returns 201 with transactionId', async () => {
+      // createTrialOffer requires the player to exist (a player_registered
+      // event) and the scout to already have access (subscription or a
+      // prior contact unlock) before it will submit the on-chain offer.
+      const createdAt = Date.now();
+      getDb()
+        .prepare(
+          `INSERT INTO events (type, ledger, tx_hash, payload, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(
+          'player_registered',
+          1,
+          'tx-player-99-registered',
+          JSON.stringify({ player_id: 'player-99' }),
+          createdAt,
+        );
+      insertContactUnlock({
+        scout_wallet: SCOUT_WALLET,
+        player_id: 'player-99',
+        tx_hash: 'tx-unlock-player-99',
+        unlocked_at: Math.floor(createdAt / 1000),
+      });
+
       const token = await getScoutToken();
       const res = await request(app)
         .post(`/api/scouts/${SCOUT_WALLET}/trial-offers`)
@@ -103,7 +148,7 @@ describe('#285 trial_offers', () => {
       expect(res.body.data.transactionId).toBe('mock-tx-hash-trial-offer-test');
 
       // Verify persisted
-      const stored = getTrialOffers(SCOUT_WALLET).find(
+      const stored = (await getTrialOffers(SCOUT_WALLET)).find(
         (o) => o.tx_hash === 'mock-tx-hash-trial-offer-test'
       );
       expect(stored).toBeDefined();

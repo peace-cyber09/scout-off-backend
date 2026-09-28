@@ -8,6 +8,12 @@ import {
 } from '../services/eventBroadcaster';
 import { ContractEventType } from '../types';
 import { logger } from '../utils/logger';
+import {
+  isWalletBlocklisted,
+  refreshBlockedWallets,
+  onWalletBlocked,
+} from '../services/walletBlocklist';
+import * as tokenBlocklistModule from '../services/tokenBlocklist';
 
 const router = Router();
 
@@ -19,11 +25,29 @@ const KEEPALIVE_INTERVAL_MS = parseInt(
   10,
 );
 
-/** Maximum number of concurrent SSE connections (0 = unlimited). */
-const MAX_SSE_CONNECTIONS = parseInt(
-  process.env.SSE_MAX_CONNECTIONS ?? '0',
+/**
+ * Interval for the shared authorization sweep, in milliseconds.
+ *
+ * The sweep re-checks the token-revocation blocklist and wallet blocklist in
+ * a SINGLE query per process (never one per connection or per keep-alive
+ * tick) so revocations/blocklists that were persisted by another backend
+ * instance are detected within this bound. In-process revocations are
+ * delivered synchronously via event listeners and take effect immediately.
+ *
+ * Documented detection bound (see docs/auth.md):
+ *   - same-process revocation/blocklist: immediate (synchronous event)
+ *   - cross-process: ≤ SSE_AUTH_SWEEP_INTERVAL_MS (default 30 000 ms)
+ */
+const AUTH_SWEEP_INTERVAL_MS = parseInt(
+  process.env.SSE_AUTH_SWEEP_INTERVAL_MS ?? '30000',
   10,
 );
+
+/** Maximum number of concurrent SSE connections (0 = unlimited). Read live
+ *  (not cached at module load) so tests can flip it per-case. */
+function getMaxSseConnections(): number {
+  return parseInt(process.env.SSE_MAX_CONNECTIONS ?? '0', 10);
+}
 
 // ─── Valid event type set (for query param validation) ────────────────────────
 
@@ -56,6 +80,56 @@ function formatSseFrame(event: BroadcastEvent): string {
  *  proxy/load-balancer timeouts on idle connections. */
 const KEEPALIVE_FRAME = ': ping\n\n';
 
+// ─── Bounded authorization sweep (one interval per process) ──────────────────
+
+/**
+ * Active, connected sessions. Each entry carries the auth state needed to
+ * terminate the stream (jti, wallet) plus the subscriber itself.
+ * The entry is added by the route handler and removed in cleanup().
+ */
+interface ActiveSession {
+  wallet: string;
+  jti: string | undefined;
+  subscriber: SseSubscriber;
+  /** Terminate the connection; safe to call more than once. */
+  terminate: (reason: 'token_revoked' | 'wallet_blocklisted') => void;
+}
+
+/** Sessions currently open in this process. */
+const activeSessions = new Set<ActiveSession>();
+
+/** Sweep body shared by the interval and tests. */
+export async function runAuthorizationSweep(): Promise<void> {
+  if (activeSessions.size === 0) return;
+
+  // Single query regardless of connection count — never per keep-alive tick.
+  let revokedJtis: ReadonlySet<string>;
+  try {
+    revokedJtis = new Set(await tokenBlocklistModule.getActiveRevokedJtis());
+  } catch {
+    revokedJtis = new Set();
+  }
+
+  let blockedWallets: ReadonlySet<string>;
+  try {
+    blockedWallets = new Set(await refreshBlockedWallets());
+  } catch {
+    blockedWallets = new Set();
+  }
+
+  for (const session of activeSessions) {
+    if (session.jti && revokedJtis.has(session.jti)) {
+      session.terminate('token_revoked');
+    } else if (blockedWallets.has(session.wallet)) {
+      session.terminate('wallet_blocklisted');
+    }
+  }
+}
+
+// Started lazily on first connection; unref()ed so it never keeps the process
+// alive; skips all work when no SSE sessions are open.
+let authSweepTimer: NodeJS.Timeout | null = null;
+
 // ─── Route ────────────────────────────────────────────────────────────────────
 
 /**
@@ -86,19 +160,44 @@ const KEEPALIVE_FRAME = ': ping\n\n';
  *   - milestone_submitted (player/validator)
  *   - fees_withdrawn      (admin)
  *
+ * Live authorization enforcement (#1019):
+ *   - If the authenticated JWT is revoked (via POST /auth/logout or admin
+ *     token revocation) while the stream is open, the connection emits a
+ *     terminal `session_ended` event (reason "token_revoked") and closes;
+ *     no further protected events are delivered.
+ *   - If the wallet is blocklisted while the stream is open, the same
+ *     termination happens with reason "wallet_blocklisted".
+ *   - Detection bound: immediate for revocations/blocklists processed in
+ *     this process; ≤ SSE_AUTH_SWEEP_INTERVAL_MS (default 30 s) for changes
+ *     persisted by another instance (one sweep query per process, never a
+ *     DB query per keep-alive tick).
+ *   - Blocklisted wallets cannot open a new connection (403).
+ *
  * Keep-alive: a `: ping` comment is sent every SSE_KEEPALIVE_INTERVAL_MS ms
  * (default 15 s) to prevent idle-connection timeouts.
  *
  * @auth Bearer token required (any role)
  * @response 200 text/event-stream — long-lived SSE connection
  * @response 401 { success: false, error: string } — missing or invalid token
+ * @response 403 { success: false, error: string } — wallet is blocklisted
  * @response 503 { success: false, error: string } — connection limit reached
  */
-router.get('/stream', requireAuth, (req: Request, res: Response) => {
+router.get('/stream', requireAuth, async (req: Request, res: Response) => {
   const wallet = req.account!;
 
+  // ── Blocklist gate: blocklisted wallets may not open a stream ────────────
+  if (await isWalletBlocklisted(wallet)) {
+    logger.warn(`[sse] connection rejected, wallet blocklisted=${wallet}`);
+    res.status(403).json({
+      success: false,
+      error: 'Account is blocklisted; SSE access revoked',
+    });
+    return;
+  }
+
   // ── Connection limit guard ─────────────────────────────────────────────────
-  if (MAX_SSE_CONNECTIONS > 0 && broadcaster.subscriberCount >= MAX_SSE_CONNECTIONS) {
+  const maxSseConnections = getMaxSseConnections();
+  if (maxSseConnections > 0 && broadcaster.subscriberCount >= maxSseConnections) {
     res.status(503).json({
       success: false,
       error: 'SSE connection limit reached. Please try again later.',
@@ -125,7 +224,6 @@ router.get('/stream', requireAuth, (req: Request, res: Response) => {
 
   // ── SSE response headers ───────────────────────────────────────────────────
   // Disable the request-level timeout middleware for this long-lived connection.
-  // Express's requestTimeout sets a 'timeout' on the socket; we clear it here.
   req.socket.setTimeout(0);
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -137,39 +235,100 @@ router.get('/stream', requireAuth, (req: Request, res: Response) => {
   // Send an initial connected event so the client knows the stream is open.
   res.write(`event: connected\ndata: ${JSON.stringify({ wallet })}\n\n`);
 
-  // ── Subscriber ─────────────────────────────────────────────────────────────
+  // ── Session lifecycle (termination + cleanup) ──────────────────────────────
+  let terminated = false;
+  const cleanupFns: Array<() => void> = [];
+  let keepAliveTimer: NodeJS.Timeout | null = null;
+
   const subscriber: SseSubscriber = {
     wallet,
     filter,
     send(event: BroadcastEvent): void {
       // write() returns false when the kernel buffer is full; we ignore the
       // back-pressure signal here because SSE is fire-and-forget.
-      res.write(formatSseFrame(event));
+      try {
+        res.write(formatSseFrame(event));
+      } catch {
+        // Stream already closed — nothing else to do.
+      }
     },
   };
 
+  const cleanup = (): void => {
+    if (terminated) return;
+    terminated = true;
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    broadcaster.unsubscribe(subscriber);
+    activeSessions.delete(session);
+    for (const fn of cleanupFns) {
+      try { fn(); } catch { /* listener cleanup is best-effort */ }
+    }
+    cleanupFns.length = 0;
+    logger.info(`[sse] client disconnected wallet=${wallet} total=${broadcaster.subscriberCount}`);
+  };
+
+  const terminate = (reason: 'token_revoked' | 'wallet_blocklisted'): void => {
+    if (terminated || res.writableEnded) return;
+    logger.warn(`[sse] terminating session wallet=${wallet} reason=${reason}`);
+    try {
+      res.write(`event: session_ended\ndata: ${JSON.stringify({ reason })}\n\n`);
+      res.end();
+    } catch (err) {
+      logger.warn(`[sse] error writing session_ended for ${wallet}:`, err);
+    }
+    cleanup();
+  };
+
+  const session: ActiveSession = {
+    wallet,
+    jti: req.jti,
+    subscriber,
+    terminate,
+  };
+
+  activeSessions.add(session);
   broadcaster.subscribe(subscriber);
   logger.info(`[sse] client connected wallet=${wallet} total=${broadcaster.subscriberCount}`);
 
+  // ── Live revocation/blocklist listeners (in-process, immediate) ───────────
+  if (req.jti && tokenBlocklistModule.onTokenRevoked) {
+    // Guarded: tests that mock the tokenBlocklist module may not provide
+    // onTokenRevoked — in that case in-process revocation listeners are
+    // simply unavailable and the bounded sweep still applies.
+    const unsubscribeRevoked = tokenBlocklistModule.onTokenRevoked((jti: string) => {
+      if (jti === session.jti) session.terminate('token_revoked');
+    });
+    cleanupFns.push(unsubscribeRevoked);
+  }
+  const unsubscribeBlocked = onWalletBlocked((blockedWallet: string) => {
+    if (blockedWallet === session.wallet) session.terminate('wallet_blocklisted');
+  });
+  cleanupFns.push(unsubscribeBlocked);
+
   // ── Keep-alive ─────────────────────────────────────────────────────────────
-  const keepAliveTimer = setInterval(() => {
+  keepAliveTimer = setInterval(() => {
     // Check if the response is still writable before writing.
     if (res.writableEnded) {
-      clearInterval(keepAliveTimer);
+      cleanup();
       return;
     }
     res.write(KEEPALIVE_FRAME);
   }, KEEPALIVE_INTERVAL_MS);
 
   // ── Cleanup on disconnect ─────────────────────────────────────────────────
-  const cleanup = (): void => {
-    clearInterval(keepAliveTimer);
-    broadcaster.unsubscribe(subscriber);
-    logger.info(`[sse] client disconnected wallet=${wallet} total=${broadcaster.subscriberCount}`);
-  };
+  const onClose = cleanup;
+  req.on('close', onClose);
+  req.on('aborted', onClose);
+  cleanupFns.push(() => {
+    req.removeListener('close', onClose);
+    req.removeListener('aborted', onClose);
+  });
 
-  req.on('close', cleanup);
-  req.on('aborted', cleanup);
+  // Start the shared sweep timer once the first connection opens.
+  if (!authSweepTimer) {
+    authSweepTimer = setInterval(runAuthorizationSweep, AUTH_SWEEP_INTERVAL_MS);
+    authSweepTimer.unref();
+  }
 });
 
 export default router;

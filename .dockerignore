@@ -1,12 +1,10 @@
 # Dependencies — reinstalled inside the image
 node_modules/
 
-# TypeScript source — only dist/ is needed in the runtime stage
-src/
-
 # Test files
 tests/
 __mocks__/
+coverage/
 
 # Build artifacts already copied by the builder stage
 dist/
@@ -23,13 +21,11 @@ dist/
 
 # Dev tooling
 .eslintrc.cjs
-tsconfig.json
 
 # Docs and scripts (not needed at runtime)
 docs/
 scripts/
 contracts/
-db/
 *.md
 
 # OS / editor noise

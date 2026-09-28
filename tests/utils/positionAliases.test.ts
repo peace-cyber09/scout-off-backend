@@ -1,4 +1,10 @@
-import { normalizePosition, normalizePositionOrFallback, defaultPositionAliases } from '../../src/utils/positionAliases';
+import {
+  normalizePosition,
+  normalizePositionOrFallback,
+  defaultPositionAliases,
+  canonicalizePositionKey,
+  CANONICAL_POSITIONS,
+} from '../../src/utils/positionAliases';
 
 describe('positionAliases', () => {
   test('normalizes common synonyms (fw -> forward)', () => {
@@ -30,10 +36,16 @@ describe('positionAliases', () => {
       expect(entries.length).toBeGreaterThan(0);
     });
 
+    it('only maps onto known canonical positions', () => {
+      const allowed = new Set<string>(CANONICAL_POSITIONS);
+      for (const [, canonical] of entries) {
+        expect(allowed.has(canonical)).toBe(true);
+      }
+    });
+
     test.each(entries)(
       'normalizePosition("%s") === "%s"',
       (alias, canonical) => {
-        // Test with the key exactly as stored (already lowercase)
         expect(normalizePosition(alias)).toBe(canonical);
       },
     );
@@ -53,11 +65,89 @@ describe('positionAliases', () => {
     );
   });
 
+  // ── Alias groups (spot-checks for abbreviations + regional spelling) ──
+
+  describe('alias groups', () => {
+    it('goalkeeper group', () => {
+      for (const alias of ['gk', 'GK', 'goalkeeper', 'goalie', 'keeper', 'goal keeper', 'Goal-Keeper']) {
+        expect(normalizePosition(alias)).toBe('goalkeeper');
+      }
+    });
+
+    it('defender group (backs + wing-backs + regional spelling)', () => {
+      for (const alias of [
+        'cb',
+        'CB',
+        'centre back',
+        'center-back',
+        'centre-back',
+        'Center Back',
+        'lb',
+        'left back',
+        'rb',
+        'right-back',
+        'lwb',
+        'rwb',
+        'sw',
+        'sweeper',
+        'full back',
+        'defence',
+        'defense',
+        'df',
+        'def',
+      ]) {
+        expect(normalizePosition(alias)).toBe('defender');
+      }
+    });
+
+    it('midfielder group (CDM/CM/CAM + British/American forms)', () => {
+      for (const alias of [
+        'cm',
+        'CDM',
+        'cam',
+        'dm',
+        'mf',
+        'mid',
+        'defensive midfielder',
+        'attacking midfield',
+        'centre midfielder',
+        'center midfielder',
+        'left midfielder',
+        'right midfield',
+        'box to box',
+        'number 10',
+      ]) {
+        expect(normalizePosition(alias)).toBe('midfielder');
+      }
+    });
+
+    it('forward group (ST/LW/RW/winger + centre/center forward)', () => {
+      for (const alias of [
+        'st',
+        'ST',
+        'fw',
+        'fwd',
+        'cf',
+        'striker',
+        'lw',
+        'rw',
+        'winger',
+        'left wing',
+        'right-winger',
+        'centre forward',
+        'center-forward',
+        'second striker',
+        'false 9',
+      ]) {
+        expect(normalizePosition(alias)).toBe('forward');
+      }
+    });
+  });
+
   // ── Case-insensitivity spot-checks ──
 
   describe('case-insensitive matching', () => {
     it('lowercased alias resolves correctly', () => {
-      // ST is not in the map; test a real alias in mixed case
       expect(normalizePosition('FW')).toBe('forward');
       expect(normalizePosition('Fw')).toBe('forward');
       expect(normalizePosition('fW')).toBe('forward');
@@ -82,19 +172,56 @@ describe('positionAliases', () => {
     });
   });
 
+  describe('hyphen / underscore / spacing normalization', () => {
+    it('canonicalizePositionKey collapses separators', () => {
+      expect(canonicalizePositionKey('Centre-Back')).toBe('centre back');
+      expect(canonicalizePositionKey('center_back')).toBe('center back');
+      expect(canonicalizePositionKey('  Left   Wing  ')).toBe('left wing');
+    });
+
+    it('hyphenated and spaced forms resolve identically', () => {
+      expect(normalizePosition('centre-back')).toBe(normalizePosition('centre back'));
+      expect(normalizePosition('center_forward')).toBe(normalizePosition('center forward'));
+      expect(normalizePosition('left-wing')).toBe(normalizePosition('left wing'));
+    });
+  });
+
   // ── Edge cases ──
 
   describe('edge cases', () => {
     it('unknown alias: normalizePosition returns undefined', () => {
-      expect(normalizePosition('winger')).toBeUndefined();
-      expect(normalizePosition('ST')).toBeUndefined();
-      expect(normalizePosition('cb')).toBeUndefined();
-      expect(normalizePosition('lb')).toBeUndefined();
+      expect(normalizePosition('quarterback')).toBeUndefined();
+      expect(normalizePosition('point-guard')).toBeUndefined();
+      expect(normalizePosition('not-a-real-position')).toBeUndefined();
+    });
+
+    it('ST resolves to forward', () => {
+      expect(normalizePosition('ST')).toBe('forward');
+      expect(normalizePosition('st')).toBe('forward');
+      expect(normalizePosition('St')).toBe('forward');
+    });
+
+    it('CM resolves to midfielder', () => {
+      expect(normalizePosition('CM')).toBe('midfielder');
+      expect(normalizePosition('cm')).toBe('midfielder');
+    });
+
+    it('CB and LB resolve to defender', () => {
+      expect(normalizePosition('CB')).toBe('defender');
+      expect(normalizePosition('cb')).toBe('defender');
+      expect(normalizePosition('lb')).toBe('defender');
+      expect(normalizePosition('LB')).toBe('defender');
+    });
+
+    it('LW/RW/winger resolve to forward', () => {
+      expect(normalizePosition('lw')).toBe('forward');
+      expect(normalizePosition('rw')).toBe('forward');
+      expect(normalizePosition('winger')).toBe('forward');
     });
 
     it('unknown alias: normalizePositionOrFallback returns the trimmed input unchanged', () => {
-      expect(normalizePositionOrFallback('winger')).toBe('winger');
-      expect(normalizePositionOrFallback('  winger  ')).toBe('winger');
+      expect(normalizePositionOrFallback('quarterback')).toBe('quarterback');
+      expect(normalizePositionOrFallback('  quarterback  ')).toBe('quarterback');
     });
 
     it('empty string: normalizePosition returns undefined (falsy guard in implementation)', () => {
@@ -102,7 +229,6 @@ describe('positionAliases', () => {
     });
 
     it('empty string: normalizePositionOrFallback returns an empty string', () => {
-      // normalizePosition('') returns undefined → fallback is input.trim() = ''
       expect(normalizePositionOrFallback('')).toBe('');
     });
 

@@ -34,7 +34,45 @@ process.env.ADMIN_WALLET =
 process.env.WEBHOOK_SECRET_ENCRYPTION_KEY =
   process.env.WEBHOOK_SECRET_ENCRYPTION_KEY ??
   "0".repeat(63) + "1";
+// Deterministic 32-byte hex pepper for api_keys.lookup_hash (#1033). Set here
+// (before src/config is first imported) so tests exercise the real HMAC
+// derivation instead of the insecure dev-only fallback, and so the suites that
+// reload config with NODE_ENV=production do not trip the startup guard that
+// requires this variable in production.
+process.env.API_KEY_LOOKUP_SECRET =
+  process.env.API_KEY_LOOKUP_SECRET ??
+  "a".repeat(63) + "b";
 
-import { initDb } from "../src/db";
+// jest-circus (the default runner since Jest 27, sole runner in Jest 30)
+// removed the global `fail()` helper that jest-jasmine2 provided. Several
+// suites still call it. Restore a minimal equivalent.
+if (typeof (globalThis as { fail?: unknown }).fail !== "function") {
+  (globalThis as { fail?: (reason?: unknown) => never }).fail = (
+    reason: unknown = "fail() was called",
+  ): never => {
+    throw reason instanceof Error
+      ? reason
+      : new Error(typeof reason === "string" ? reason : JSON.stringify(reason));
+  };
+}
 
-initDb();
+import { closeDb, initDb } from "../src/db";
+
+// initDb() is async (required to support DB_DRIVER=postgres's async
+// connection setup) — this file runs as setupFilesAfterEnv rather than
+// setupFiles specifically so that `beforeAll` (installed by the test
+// framework) is available here to await it before any test in the file runs.
+beforeAll(async () => {
+  await initDb();
+});
+
+// Close the database at the end of every suite so better-sqlite3 finalizes
+// every prepared Statement while the Node environment is still alive. Without
+// this, `jest --forceExit` tears the process down with live Statement wrappers
+// still pending GC; their C++ destructors then call RemoveEnvironmentCleanupHook
+// after the environment is gone, which aborts the process on Node 24
+// ("Assertion failed: (env) != nullptr"). closeDb() is idempotent, so suites
+// that already close explicitly are unaffected.
+afterAll(async () => {
+  await closeDb();
+});

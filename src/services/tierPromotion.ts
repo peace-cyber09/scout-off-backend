@@ -7,16 +7,20 @@ import { ProgressLevel } from '../types';
 // the highest tier whose minimum-milestone threshold their approved count meets
 // or exceeds:
 //
-//   approved milestones │ tier │ meaning
-//   ────────────────────┼──────┼──────────────────────────────────────
-//   0                   │  0   │ Unverified (initial state at registration)
-//   1–2                 │  1   │ Emerging
-//   3–5                 │  2   │ Established
-//   6 or more           │  3   │ Elite
+//   approved milestones │ tier │ name        │ description
+//   ────────────────────┼──────┼─────────────┼────────────────────────────────────────────────
+//   0                   │  0   │ Unverified  │ Player has registered but no milestones approved
+//   1–2                 │  1   │ Emerging    │ At least one approved milestone — initial ability confirmed
+//   3–5                 │  2   │ Established │ Multiple approved milestones — consistent performance on record
+//   6 or more           │  3   │ Elite       │ Six or more approved milestones — top-tier verified performance
 //
-// Thresholds are intentionally monotonic and data-driven (a single source of
-// truth) so the indexer and the tests cannot drift apart. Tweak the numbers in
-// TIER_THRESHOLDS to retune promotion; no other code needs to change.
+// These names and descriptions are the canonical taxonomy; they match
+// docs/tier-promotion.md and the README tier table.
+//
+// NOTE: Code-level unification of tier logic into a single shared module is
+// tracked separately (see the canonical state-machine refactor issue). Tweak
+// the thresholds in TIER_THRESHOLDS to retune promotion; no other code needs to
+// change.
 
 export interface TierThreshold {
   tier: ProgressLevel;

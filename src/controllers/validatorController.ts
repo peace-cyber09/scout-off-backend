@@ -4,14 +4,17 @@ import { z } from 'zod';
 import axios from 'axios';
 import { logger } from '../utils/logger';
 import { pinJson, pinFile } from '../services/ipfs';
-import { getPendingMilestones as getPendingMilestonesFromDb, getDb, removePendingMilestone, incrementValidatorApproved, queryEvents, updatePlayerProgress } from '../db';
+import { getPendingMilestones as getPendingMilestonesFromDb, getDriver, removePendingMilestone, incrementValidatorApproved, queryEvents, updatePlayerProgress, getValidatorStats } from '../db';
 import { invalidateMilestoneCache } from '../services/cache';
 import { recordAudit } from '../utils/audit';
-import { isValidEvidenceUri } from '../utils/uriValidator';
+import { isValidMetadataUri, URI_VALIDATION_ERROR } from '../utils/uriValidator';
+import { checkWalletOwnership } from '../middleware/requireOwner';
+
+// Re-exported so callers/tests can import the metadata_uri validator directly
+// from validatorController without reaching into utils/uriValidator.
+export { isValidMetadataUri };
 import { tierForApprovedMilestones } from '../services/tierPromotion';
 import config from '../config';
-
-export { isValidMetadataUri as isValidEvidenceUri };
 
 /** MIME types accepted as evidence. */
 const ALLOWED_CONTENT_TYPE_PREFIXES = ['video/', 'image/', 'application/pdf', 'text/plain'];
@@ -51,7 +54,7 @@ export async function downloadAndPinEvidence(url: string): Promise<string> {
     contentType = (head.headers['content-type'] as string | undefined) ?? '';
     const clHeader = head.headers['content-length'];
     if (clHeader) {
-      contentLength = parseInt(clHeader, 10);
+      contentLength = parseInt(String(clHeader), 10);
     }
   } catch {
     // Some servers reject HEAD — fall through to GET with streaming
@@ -108,13 +111,24 @@ export const milestoneSchema = z.object({
   playerId: z.string().min(1),
   milestoneType: z.enum(['identity', 'performance', 'trial_offer']),
   evidenceUri: z.string().min(1).refine(isValidMetadataUri, URI_VALIDATION_ERROR),
-});
+  // Optional free-text fields (#29). Accepted and persisted with the audit
+  // record; not required for submission.
+  notes: z.string().max(2000).optional(),
+  validatorComment: z.string().max(2000).optional(),
+}).strict();
+
+export const MAX_PAGE_SIZE = 100;
 
 export const pendingQuerySchema = z.object({
   region: z.string().optional(),
   position: z.string().optional(),
   playerId: z.string().optional(),
+  // Inclusive bounds on submitted_at (Unix seconds), issue #1135.
+  submittedAfter: z.coerce.number().int().optional(),
+  submittedBefore: z.coerce.number().int().optional(),
   page: z.coerce.number().int().min(1).optional(),
+  // Literal 100 (== MAX_PAGE_SIZE) so the OpenAPI generator's static analysis
+  // can emit `maximum: 100`.
   pageSize: z.coerce.number().int().min(1).max(100).optional(),
 });
 
@@ -124,7 +138,7 @@ function getCorrelationId(req: Request): string {
 }
 
 export async function submitMilestoneEvidence(req: Request, res: Response, next: NextFunction): Promise<void> {
-  try {
+try {
     const { playerId, milestoneType, evidenceUri } = milestoneSchema.parse(req.body);
 
     let evidenceCid: string;
@@ -160,7 +174,7 @@ export async function submitMilestoneEvidence(req: Request, res: Response, next:
       `[validator] action=submit_milestone validator=${validatorWallet} playerId=${playerId} milestoneType=${milestoneType} evidenceCid=${evidenceCid} correlationId=${correlationId}`
     );
 
-    recordAudit(validatorWallet, 'milestone_submitted', { playerId, milestoneType, evidenceCid }, `correlationId=${correlationId}`);
+    await recordAudit(validatorWallet, 'milestone_submitted', { playerId, milestoneType, evidenceCid }, `correlationId=${correlationId}`);
 
     res.status(201).json({ success: true, data: { evidenceCid } });
   } catch (err) {
@@ -170,95 +184,97 @@ export async function submitMilestoneEvidence(req: Request, res: Response, next:
 
 /** GET /api/validators/milestones/pending or /api/validators/:wallet/milestones/pending */
 export async function getPendingMilestones(req: Request, res: Response, next: NextFunction): Promise<void> {
-  try {
-    const { region, position, playerId, page, pageSize } = pendingQuerySchema.parse(req.query);
-    const validatorWallet = req.params.wallet || req.account;
-    const { data, total } = getPendingMilestonesFromDb({
-      validatorWallet: validatorWallet,
-      region,
-      position,
-      playerId,
-      page,
-      pageSize,
-    });
+  const { region, position, playerId, submittedAfter, submittedBefore, page, pageSize } =
+    pendingQuerySchema.parse(req.query);
+  const validatorWallet = req.params.wallet as string || req.account;
+  const { data, total } = await getPendingMilestonesFromDb({
+    validatorWallet: validatorWallet,
+    region,
+    position,
+    playerId,
+    submittedAfter,
+    submittedBefore,
+    page,
+    pageSize,
+  });
 
-    // Transform to the desired output format
-    const milestones = data.map((m) => ({
-      milestoneId: m.milestone_id,
-      playerId: m.player_id,
-      milestoneType: m.milestone_type,
-      evidenceUri: m.evidence_uri,
-      submittedAt: m.submitted_at,
-    }));
+  // Transform to the desired output format
+  const milestones = data.map((m) => ({
+    milestoneId: m.milestone_id,
+    playerId: m.player_id,
+    milestoneType: m.milestone_type,
+    evidenceUri: m.evidence_uri,
+    submittedAt: m.submitted_at,
+  }));
 
-    const currentValidatorWallet = req.account ?? 'unknown';
-    recordAudit(
-      currentValidatorWallet, 
-      'pending_milestones_viewed', 
-      { 
-        region: region ?? null, 
-        position: position ?? null,
-        validatorWallet,
-        pendingCount: total,
-      }, 
-      'pending milestones viewed'
-    );
+  const currentValidatorWallet = req.account ?? 'unknown';
+  await recordAudit(
+    currentValidatorWallet,
+    'pending_milestones_viewed', 
+    { 
+      region: region ?? null, 
+      position: position ?? null,
+      validatorWallet,
+      pendingCount: total,
+    }, 
+    'pending milestones viewed'
+  );
 
-    res.json({ 
-      success: true, 
-      data: milestones, 
-      total, 
-      page: page || 1, 
-      pageSize: pageSize || 20 
-    });
-  } catch (err) {
-    next(err);
-  }
+  const effectivePage = page || 1;
+  const effectivePageSize = pageSize || 20;
+  res.json({
+    success: true,
+    data: milestones,
+    total,
+    page: effectivePage,
+    pageSize: effectivePageSize,
+    hasMore: effectivePage * effectivePageSize < total,
+  });
 }
 
 export const bulkApproveSchema = z.object({
   milestoneIds: z.array(z.string()).min(1),
-});
+}).strict();
 
 export async function approveBulkMilestones(req: Request, res: Response, next: NextFunction): Promise<void> {
-  try {
+try {
     const { milestoneIds } = bulkApproveSchema.parse(req.body);
     const validatorWallet = req.account ?? 'unknown';
     const correlationId = getCorrelationId(req);
     
     const results = [];
-    const db = getDb();
-    
+    const driver = getDriver();
+
     const uniqueIds = Array.from(new Set(milestoneIds));
 
     for (const milestoneId of uniqueIds) {
       try {
-        const row = db.prepare('SELECT * FROM pending_milestones WHERE milestone_id = ?').get(milestoneId) as any;
+        const row = await driver.get<any>('SELECT * FROM pending_milestones WHERE milestone_id = ?', [milestoneId]);
         if (!row) {
           results.push({ milestoneId, status: 'invalid', error: 'Not found or already processed' });
           continue;
         }
-        
+
         if (row.validator_wallet !== validatorWallet) {
           results.push({ milestoneId, status: 'unauthorized', error: 'Not assigned to this validator' });
           continue;
         }
 
         const playerId = row.player_id;
-        
-        removePendingMilestone(milestoneId);
-        incrementValidatorApproved(validatorWallet);
-        
+
+        await removePendingMilestone(milestoneId);
+        await incrementValidatorApproved(validatorWallet);
+
         const onChainApprovedCount = queryEvents('milestone_approved').filter(
           (e) => e.payload.player_id === playerId
         ).length;
-        
+
         // Count this new off-chain approval + existing ones
-        updatePlayerProgress(playerId, tierForApprovedMilestones(onChainApprovedCount + 1));
-        
+        await updatePlayerProgress(playerId, tierForApprovedMilestones(onChainApprovedCount + 1));
+
         await invalidateMilestoneCache(playerId);
-        
-        recordAudit(
+
+        await recordAudit(
           validatorWallet,
           'milestone_approved',
           { milestoneId, playerId, bulk: true },
@@ -273,6 +289,103 @@ export async function approveBulkMilestones(req: Request, res: Response, next: N
     }
 
     res.json({ success: true, data: results });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** Maximum recent-activity items returned by the stats endpoint (#1136). */
+const RECENT_ACTIVITY_LIMIT = 20;
+
+/** Number of seconds in 30 days, used to filter approvedLast30d. */
+const THIRTY_DAYS_SECONDS = 30 * 24 * 60 * 60;
+
+/**
+ * GET /api/validators/:wallet/stats
+ *
+ * Returns a dashboard summary for the given validator wallet:
+ *   - pending:          number of pending milestones currently assigned to this validator
+ *   - approvedTotal:    total milestones approved (from validator_stats table)
+ *   - rejectedTotal:    total milestones rejected (from validator_stats table)
+ *   - approvedLast30d:  approvals recorded in the last 30 days (from indexed events)
+ *   - recent:           up to 20 most recent milestone events (submitted/approved/rejected)
+ *                       involving this validator, newest first
+ *
+ * Auth: validators may only query their own wallet; admins can query any wallet.
+ */
+export async function getValidatorDashboardStats(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const { wallet } = req.params as { wallet: string };
+
+    // Enforce ownership: validators see only their own stats; admins may query any wallet.
+    if (!checkWalletOwnership(req, res)) return;
+
+    // 1. Count pending milestones for this validator.
+    const { total: pending } = await getPendingMilestonesFromDb({
+      validatorWallet: wallet,
+      pageSize: 1,
+      page: 1,
+    });
+
+    // 2. Pull approved / rejected totals from the write-optimised stats table.
+    const statsRow = await getValidatorStats(wallet);
+    const approvedTotal = statsRow?.milestones_approved ?? 0;
+    const rejectedTotal = statsRow?.milestones_rejected ?? 0;
+
+    // 3. Derive approvedLast30d from indexed milestone_approved events.
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const cutoff = nowSeconds - THIRTY_DAYS_SECONDS;
+
+    const approvedEvents = queryEvents('milestone_approved');
+    const approvedLast30d = approvedEvents.filter((e) => {
+      const isThisValidator =
+        e.payload.validator === wallet || e.payload.validator_wallet === wallet;
+      const withinWindow =
+        typeof e.created_at === 'number' && e.created_at >= cutoff;
+      return isThisValidator && withinWindow;
+    }).length;
+
+    // 4. Build the recent-activity list (bounded to RECENT_ACTIVITY_LIMIT).
+    //    Combine submitted, approved, and rejected events for this validator.
+    const milestoneEventTypes = [
+      'milestone_submitted',
+      'milestone_approved',
+      'milestone_rejected',
+    ] as const;
+
+    const recentActivity = milestoneEventTypes
+      .flatMap((type) =>
+        queryEvents(type).filter((e) => {
+          return (
+            e.payload.validator === wallet ||
+            e.payload.validator_wallet === wallet
+          );
+        }).map((e) => ({
+          type: e.type as string,
+          playerId: (e.payload.player_id ?? e.payload.playerId ?? null) as string | null,
+          milestoneId: (e.payload.milestone_id ?? e.payload.milestoneId ?? null) as string | null,
+          createdAt: e.created_at ?? null,
+        })),
+      )
+      // Sort newest first (nulls treated as 0).
+      .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+      .slice(0, RECENT_ACTIVITY_LIMIT);
+
+    res.json({
+      success: true,
+      data: {
+        wallet,
+        pending,
+        approvedTotal,
+        rejectedTotal,
+        approvedLast30d,
+        recent: recentActivity,
+      },
+    });
   } catch (err) {
     next(err);
   }

@@ -1,5 +1,5 @@
 import { Keypair } from "@stellar/stellar-sdk";
-import { STELLAR_ADDRESS_RE } from "../../src/utils/validators";
+import { STELLAR_ADDRESS_RE, isValidIpAddress } from "../../src/utils/validators";
 
 describe("STELLAR_ADDRESS_RE", () => {
   describe("valid Stellar addresses", () => {
@@ -318,5 +318,40 @@ describe("STELLAR_ADDRESS_RE", () => {
       expect(STELLAR_ADDRESS_RE.test(publicKey.substring(0, 55))).toBe(false);
       expect(STELLAR_ADDRESS_RE.test("S" + publicKey.substring(1))).toBe(false);
     });
+  });
+});
+
+describe("isValidIpAddress", () => {
+  it("accepts valid IPv4 addresses", () => {
+    expect(isValidIpAddress("203.0.113.5")).toBe(true);
+    expect(isValidIpAddress("0.0.0.0")).toBe(true);
+    expect(isValidIpAddress("255.255.255.255")).toBe(true);
+  });
+
+  it("accepts valid IPv6 addresses", () => {
+    expect(isValidIpAddress("::1")).toBe(true);
+    expect(isValidIpAddress("2001:db8::1")).toBe(true);
+    expect(isValidIpAddress("fe80::1ff:fe23:4567:890a")).toBe(true);
+  });
+
+  it("rejects an empty string", () => {
+    expect(isValidIpAddress("")).toBe(false);
+  });
+
+  it("rejects a malformed dotted-quad address", () => {
+    expect(isValidIpAddress("999.999.999.999")).toBe(false);
+  });
+
+  it("rejects random text", () => {
+    expect(isValidIpAddress("not-an-ip")).toBe(false);
+  });
+
+  it("rejects an IPv4 address with a trailing port", () => {
+    expect(isValidIpAddress("203.0.113.5:8080")).toBe(false);
+  });
+
+  it("rejects non-string input", () => {
+    expect(isValidIpAddress(null as unknown as string)).toBe(false);
+    expect(isValidIpAddress(undefined as unknown as string)).toBe(false);
   });
 });

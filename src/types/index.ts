@@ -170,6 +170,14 @@ declare global {
       account?: string;
       /** Role of the authenticated user, e.g. 'admin', 'validator', 'scout'. */
       role?: string;
+      /** JWT ID of the bearer token used for this request (set by auth middleware). */
+      jti?: string;
+      /**
+       * Parsed API-key scopes when the request was authenticated via
+       * X-API-Key. `null` = legacy/unrestricted key; `undefined` = the
+       * request was not authenticated with an API key (e.g. JWT).
+       */
+      apiKeyScopes?: string[] | null;
     }
   }
 }
@@ -202,12 +210,16 @@ export type ContractEventType =
   | 'player_registered'
   | 'milestone_submitted'
   | 'milestone_approved'
+  | 'milestone_rejected'
   | 'scout_subscribed'
   | 'contact_unlocked'
   | 'trial_offer_logged'
   | 'trial_offer_accepted'
   | 'trial_offer_rejected'
-  | 'fees_withdrawn';
+  | 'trial_offer_cancelled'
+  | 'fees_withdrawn'
+  | 'player_deactivated'
+  | 'player_reactivated';
 
 export interface ContractEvent {
   type: ContractEventType;

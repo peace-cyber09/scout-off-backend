@@ -4,7 +4,7 @@
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import app from '../../src/app';
-import { getDb } from '../../src/db';
+import { getDriver } from '../../src/db';
 import {
   clearFeatureFlagCache,
   FeatureFlags,
@@ -50,9 +50,10 @@ describe('saved searches live feature-flag integration (#494)', () => {
     expect(blockedRes.status).toBe(404);
     expect(blockedRes.body.code).toBe('FEATURE_DISABLED');
 
-    const row = getDb()
-      .prepare('SELECT enabled FROM feature_flags WHERE name = ?')
-      .get(FeatureFlags.SAVED_SEARCHES) as { enabled: number };
+    const row = (await getDriver().get(
+      'SELECT enabled FROM feature_flags WHERE name = ?',
+      [FeatureFlags.SAVED_SEARCHES],
+    )) as { enabled: number };
     expect(row.enabled).toBe(0);
   });
 });

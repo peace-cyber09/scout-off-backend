@@ -28,6 +28,29 @@ permissions:
   contents: read
 
 jobs:
+  # GitHub Actions forbids the `secrets` context in a job-level `if:`, so probe
+  # for the deploy credentials in a step and expose the result as an output the
+  # deploy job can gate on. When the `staging` environment has no
+  # STAGING_SSH_PRIVATE_KEY configured, the deploy + smoke-test jobs are skipped
+  # (a neutral result) instead of failing every push to main.
+  preflight:
+    name: Check deploy config
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          STAGING_SSH_PRIVATE_KEY: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -n "$STAGING_SSH_PRIVATE_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Staging deploy skipped::STAGING_SSH_PRIVATE_KEY is not configured on the staging environment; the deploy and smoke-test jobs will be skipped."
+          fi
+
   build:
     name: Build & test
     runs-on: ubuntu-latest
@@ -79,11 +102,19 @@ jobs:
 
       - name: Package release
         run: |
-          tar czf release.tar.gz \
+          # Write the archive outside the directory being archived. Even with
+          # --exclude=release.tar.gz, tar still stats the containing directory
+          # (`.`) as it walks it — creating the output file inside that same
+          # directory changes its mtime mid-walk and tar unconditionally exits
+          # 1 for "file changed as we read it" (--warning=KEYWORD only
+          # silences the message, it doesn't stop the exit). Writing to
+          # RUNNER_TEMP sidesteps the self-reference entirely.
+          tar -czf "$RUNNER_TEMP/release.tar.gz" \
             --exclude=node_modules \
             --exclude=.git \
             --exclude=coverage \
             .
+          mv "$RUNNER_TEMP/release.tar.gz" release.tar.gz
 
       - uses: actions/upload-artifact@v4
         with:
@@ -93,13 +124,21 @@ jobs:
 
   deploy:
     name: Deploy to staging
-    needs: build
+    needs: [preflight, build]
+    if: needs.preflight.outputs.configured == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment:
       name: staging
-      url: ${{ secrets.STAGING_URL }}
+      # environment.url does not support the secrets context directly, so
+      # resolve it through a step output instead (steps.<id>.outputs.* is
+      # allowed here).
+      url: ${{ steps.set-url.outputs.url }}
     steps:
+      - name: Resolve staging URL
+        id: set-url
+        run: echo "url=${{ secrets.STAGING_URL }}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/download-artifact@v4
         with:
           name: staging-release

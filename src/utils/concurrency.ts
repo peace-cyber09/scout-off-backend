@@ -42,6 +42,38 @@ export class Semaphore {
 }
 
 /**
+ * A simple mutual exclusion lock built on top of Semaphore.
+ * Only one caller at a time may hold the lock; others queue and wait.
+ */
+export class Mutex {
+  private readonly semaphore = new Semaphore(1);
+
+  async lock(): Promise<() => void> {
+    await this.semaphore.acquire();
+    let released = false;
+    return () => {
+      if (!released) {
+        released = true;
+        this.semaphore.release();
+      }
+    };
+  }
+
+  /**
+   * Run `fn` exclusively — acquires the lock before calling fn and
+   * releases it when fn resolves or rejects.
+   */
+  async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const unlock = await this.lock();
+    try {
+      return await fn();
+    } finally {
+      unlock();
+    }
+  }
+}
+
+/**
  * Execute an array of async functions with a concurrency limit.
  * Returns an array of results (or errors if rejected) matching the input array order.
  * All operations are attempted regardless of individual failures (allSettled semantics).

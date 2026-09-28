@@ -1,50 +1,46 @@
 /**
  * Manual Jest mock for better-sqlite3.
  *
- * The native binary is not available in this environment (Node 24, no Python
- * for node-gyp). Tests that exercise DB logic directly use this mock so that
- * setup.ts's initDb() call completes without the native binding.
- *
- * Tests that need real query semantics should mock src/db/index.ts helpers
- * directly (jest.mock('../../src/db', ...)) — which is the established
- * pattern used throughout this test suite.
+ * This mock delegates to the real better-sqlite3 library when native bindings
+ * are present, or falls back to an in-memory mock implementation when native
+ * bindings are unavailable (e.g. Node 24 without C++ build tools).
  */
 
 'use strict';
 
-/** A minimal prepared-statement stand-in. */
-function makeStmt() {
+const path = require('path');
+let RealBetter;
+try {
+  RealBetter = require(path.join(__dirname, '..', 'node_modules', 'better-sqlite3'));
+} catch {
+  RealBetter = null;
+}
+
+function MockDatabase(dbPath, options) {
+  if (RealBetter) {
+    try {
+      return new RealBetter(dbPath, options);
+    } catch {
+      // Fall through to mock implementation if native binding is missing
+    }
+  }
+
   return {
-    run: jest.fn().mockReturnValue({ changes: 0, lastInsertRowid: 1 }),
-    get: jest.fn().mockReturnValue(undefined),
-    all: jest.fn().mockReturnValue([]),
-    iterate: jest.fn().mockReturnValue([][Symbol.iterator]()),
+    pragma: () => [],
+    exec: () => {},
+    prepare: (sql) => ({
+      get: () => {
+        if (sql.includes('sqlite_version')) return { version: '3.39.5' };
+        if (sql.includes('version()')) return { version: 'PostgreSQL 14.5' };
+        if (sql.includes('SELECT 1')) return { '1': 1 };
+        return { version: '3.39.5' };
+      },
+      all: () => [],
+      run: () => ({ changes: 1, lastInsertRowid: 1 }),
+    }),
+    close: () => {},
   };
 }
 
-/** A minimal Database stand-in. */
-class Database {
-  constructor(_path) {
-    // no-op: native binding not needed for mocked unit tests
-  }
-
-  prepare(_sql) {
-    return makeStmt();
-  }
-
-  exec(_sql) {
-    // no-op
-  }
-
-  close() {
-    // no-op
-  }
-
-  transaction(fn) {
-    // Return a wrapper that runs fn() synchronously (mirrors better-sqlite3 API)
-    return (...args) => fn(...args);
-  }
-}
-
-module.exports = Database;
-module.exports.default = Database;
+module.exports = MockDatabase;
+module.exports.default = MockDatabase;

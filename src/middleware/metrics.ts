@@ -1,6 +1,25 @@
 import { Request, Response, NextFunction } from 'express';
 import { ipReputationCounters, resetIpReputationCounters } from '../services/ipReputation';
 
+// ── Tier divergence counter injection (#1132) ──────────────────────────────────
+//
+// The actual counter lives in src/services/tierDivergenceJob.ts to avoid a
+// circular import chain (metrics ← tierDivergenceJob ← db ← metrics).
+// The getter is registered at startup by src/index.ts via
+// `setTierDivergenceGetter`; until then it defaults to () => 0 so the metric
+// is always present in Prometheus output (just zero).
+
+let _getTierDivergenceTotal: () => number = () => 0;
+
+/** Register the live counter getter. Called once at startup by src/index.ts. */
+export function setTierDivergenceGetter(fn: () => number): void {
+  _getTierDivergenceTotal = fn;
+}
+
+function getTierDivergenceForMetrics(): number {
+  return _getTierDivergenceTotal();
+}
+
 export interface RouteMetric {
   count: number;
   totalLatencyMs: number;
@@ -223,8 +242,83 @@ export function decrementSseConnections(): void {
   sseConnectionsActive = Math.max(0, sseConnectionsActive - 1);
 }
 
-export function getSseConnectionsActive(): number {
-  return sseConnectionsActive;
+// ─── Stuck pending pins gauge ─────────────────────────────────────────────────
+
+/** In-memory gauge for currently stuck pending IPFS pins. */
+let stuckPendingPinsCount = 0;
+
+export function setStuckPendingPinsCount(count: number): void {
+  stuckPendingPinsCount = Math.max(0, count);
+}
+
+export function getStuckPendingPinsCount(): number {
+  return stuckPendingPinsCount;
+}
+
+// ─── Webhook dead-letter counters / gauges (#1131) ────────────────────────────
+// Declared before resetMetrics so test isolation can clear them.
+
+export interface WebhookCounters {
+  deadLettersTotal: number;
+  retrySuccessTotal: number;
+}
+
+export const webhookCountersStore: WebhookCounters = {
+  deadLettersTotal: 0,
+  retrySuccessTotal: 0,
+};
+
+/** Per-subscription gauge for current dead-letter queue depth. */
+const webhookDeadLetterGaugeStore: Record<string, number> = {};
+
+/** Timestamps of recent dead-letter inserts for rate-based alerting. */
+const webhookDeadLetterInsertTimestamps: number[] = [];
+
+/** Increment webhook_dead_letters_total counter (lifetime inserts). */
+export function incrementWebhookDeadLettersTotal(): void {
+  webhookCountersStore.deadLettersTotal += 1;
+  webhookDeadLetterInsertTimestamps.push(Date.now());
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  while (
+    webhookDeadLetterInsertTimestamps.length > 0 &&
+    webhookDeadLetterInsertTimestamps[0]! < cutoff
+  ) {
+    webhookDeadLetterInsertTimestamps.shift();
+  }
+}
+
+/** Increment webhook_retry_success_total counter. */
+export function incrementWebhookRetrySuccessTotal(): void {
+  webhookCountersStore.retrySuccessTotal += 1;
+}
+
+/** Returns a snapshot of webhook counters. */
+export function getWebhookCounters(): WebhookCounters {
+  return { ...webhookCountersStore };
+}
+
+export function setWebhookDeadLetterGauge(
+  entries: Array<{ subscriptionId: string; count: number }>,
+): void {
+  for (const key of Object.keys(webhookDeadLetterGaugeStore)) {
+    delete webhookDeadLetterGaugeStore[key];
+  }
+  for (const entry of entries) {
+    webhookDeadLetterGaugeStore[entry.subscriptionId] = entry.count;
+  }
+}
+
+export function getWebhookDeadLetterGauge(): Record<string, number> {
+  return { ...webhookDeadLetterGaugeStore };
+}
+
+export function getWebhookDeadLetterInsertTimestamps(): number[] {
+  return [...webhookDeadLetterInsertTimestamps];
+}
+
+/** Test helper — clear insert-rate timestamps. */
+export function resetWebhookDeadLetterInsertTimestamps(): void {
+  webhookDeadLetterInsertTimestamps.length = 0;
 }
 
 /** Resets every metric store. Intended for test isolation. */
@@ -238,6 +332,8 @@ export function resetMetrics(): void {
   cacheCountsStore.hits = 0;
   cacheCountsStore.misses = 0;
   cacheCountsStore.evictions = 0;
+  cacheInvalidationStore.total = 0;
+  stuckPendingPinsCount = 0;
   resetIpReputationCounters();
 }
 
@@ -277,31 +373,48 @@ export function getCacheMetrics(): CacheCounts {
   return { ...cacheCountsStore };
 }
 
-// ─── Webhook dead-letter counters ─────────────────────────────────────────────
+// ─── Cache invalidation counter ────────────────────────────────────────────────
+//
+// `cache_invalidation_total` counts every player-list cache invalidation
+// performed by this process:
+//   - one increment per `invalidatePlayerCache()` operation (local calls, e.g.
+//     from the indexer after a player state change), and
+//   - one increment per `invalidate:players` pub/sub message received from a
+//     sibling instance that clears the local player-list cache.
+//
+// So across a multi-instance deployment each logical invalidation produces one
+// increment on the originating instance and one on every instance that applies
+// it locally — the metric reflects actual invalidation activity per process.
 
-export interface WebhookCounters {
-  deadLettersTotal: number;
-  retrySuccessTotal: number;
+export interface CacheInvalidationCounts {
+  total: number;
 }
 
-export const webhookCountersStore: WebhookCounters = {
-  deadLettersTotal: 0,
-  retrySuccessTotal: 0,
-};
+/** In-memory cache invalidation counter. */
+export const cacheInvalidationStore: CacheInvalidationCounts = { total: 0 };
 
-/** Increment webhook_dead_letters_total counter. */
-export function incrementWebhookDeadLettersTotal(): void {
-  webhookCountersStore.deadLettersTotal += 1;
+/** Record one player-list cache invalidation operation (local or received). */
+export function recordCacheInvalidation(): void {
+  cacheInvalidationStore.total += 1;
 }
 
-/** Increment webhook_retry_success_total counter. */
-export function incrementWebhookRetrySuccessTotal(): void {
-  webhookCountersStore.retrySuccessTotal += 1;
+/** Returns the current cache invalidation counter. */
+export function getCacheInvalidationTotal(): number {
+  return cacheInvalidationStore.total;
 }
 
-/** Returns a snapshot of webhook counters. */
-export function getWebhookCounters(): WebhookCounters {
-  return { ...webhookCountersStore };
+// ─── Fee withdrawal DB-write failure counter ──────────────────────────────────
+
+const feeWithdrawalDbWriteFailuresStore = { total: 0 };
+
+/** Increment scout_off_fee_withdrawal_db_write_failures_total counter. */
+export function incrementFeeWithdrawalDbWriteFailuresTotal(): void {
+  feeWithdrawalDbWriteFailuresStore.total += 1;
+}
+
+/** Returns the current fee-withdrawal DB-write-failure counter. */
+export function getFeeWithdrawalDbWriteFailuresTotal(): number {
+  return feeWithdrawalDbWriteFailuresStore.total;
 }
 
 // ─── Prometheus exposition ──────────────────────────────────────────────────────
@@ -319,6 +432,8 @@ export interface SerializeMetricsExtras {
   indexerLedgerLag?: number;
   /** Optional sse_connections_active gauge value, injected by the caller. */
   sseConnectionsActive?: number;
+  /** Optional stuck_pending_pins_count gauge value, injected by the caller. */
+  stuckPendingPinsCount?: number;
 }
 
 /**
@@ -369,6 +484,11 @@ export function serializeMetrics(extras: SerializeMetricsExtras = {}): string {
   lines.push('# TYPE cache_evictions_total counter');
   lines.push(`cache_evictions_total ${cache.evictions}`);
 
+  // Cache invalidation counter.
+  lines.push('# HELP cache_invalidation_total Total number of player-list cache invalidations performed (local operations and received invalidate:players messages)');
+  lines.push('# TYPE cache_invalidation_total counter');
+  lines.push(`cache_invalidation_total ${cacheInvalidationStore.total}`);
+
   // IPFS operation duration histogram.
   lines.push('# HELP ipfs_operation_duration_seconds IPFS operation latency in seconds');
   lines.push('# TYPE ipfs_operation_duration_seconds histogram');
@@ -406,12 +526,12 @@ export function serializeMetrics(extras: SerializeMetricsExtras = {}): string {
   }
 
   // Webhook delivery counters.
-  const webhook = getWebhookDeliveryMetrics();
+  const webhookDelivery = getWebhookDeliveryMetrics();
   lines.push('# HELP webhook_delivery_total Total number of webhook deliveries by status');
   lines.push('# TYPE webhook_delivery_total counter');
-  lines.push(`webhook_delivery_total{status="success"} ${webhook.success}`);
-  lines.push(`webhook_delivery_total{status="failure"} ${webhook.failure}`);
-  lines.push(`webhook_delivery_total{status="dead_letter"} ${webhook.dead_letter}`);
+  lines.push(`webhook_delivery_total{status="success"} ${webhookDelivery.success}`);
+  lines.push(`webhook_delivery_total{status="failure"} ${webhookDelivery.failure}`);
+  lines.push(`webhook_delivery_total{status="dead_letter"} ${webhookDelivery.dead_letter}`);
 
   // SSE active connections gauge.
   if (extras.sseConnectionsActive !== undefined) {
@@ -427,6 +547,29 @@ export function serializeMetrics(extras: SerializeMetricsExtras = {}): string {
     lines.push(`indexer_ledger_lag ${extras.indexerLedgerLag}`);
   }
 
+  // Stuck pending IPFS pins gauge.
+  const stuckPins = extras.stuckPendingPinsCount !== undefined ? extras.stuckPendingPinsCount : getStuckPendingPinsCount();
+  lines.push('# HELP stuck_pending_pins_count Current number of stuck pending IPFS pins');
+  lines.push('# TYPE stuck_pending_pins_count gauge');
+  lines.push(`stuck_pending_pins_count ${stuckPins}`);
+
+  // Dead-letter queue depth gauge (#1131) — broken down per subscription.
+  lines.push('# HELP scout_off_webhook_dead_letters_total Current webhook dead-letter queue depth by subscription');
+  lines.push('# TYPE scout_off_webhook_dead_letters_total gauge');
+  const dlGauge = getWebhookDeadLetterGauge();
+  for (const [subscriptionId, count] of Object.entries(dlGauge)) {
+    lines.push(
+      `scout_off_webhook_dead_letters_total{subscription_id="${escapeLabelValue(subscriptionId)}"} ${count}`,
+    );
+  }
+  // Always emit a lifetime insert counter for dashboards that prefer counters.
+  lines.push('# HELP scout_off_webhook_dead_letters_inserted_total Lifetime webhook dead-letter inserts');
+  lines.push('# TYPE scout_off_webhook_dead_letters_inserted_total counter');
+  lines.push(`scout_off_webhook_dead_letters_inserted_total ${webhook.deadLettersTotal}`);
+  lines.push('# HELP scout_off_webhook_retry_success_total Successful dead-letter auto-retries');
+  lines.push('# TYPE scout_off_webhook_retry_success_total counter');
+  lines.push(`scout_off_webhook_retry_success_total ${webhook.retrySuccessTotal}`);
+
   // IP reputation counters.
   lines.push('# HELP ip_reputation_blocked_total Total number of requests blocked by IP reputation scoring');
   lines.push('# TYPE ip_reputation_blocked_total counter');
@@ -435,6 +578,14 @@ export function serializeMetrics(extras: SerializeMetricsExtras = {}): string {
   lines.push('# TYPE ip_reputation_penalised_total counter');
   lines.push(`ip_reputation_penalised_total ${ipReputationCounters.penalised}`);
 
+  // Tier divergence counter (#1132) — counts mismatches between derived off-chain
+  // tier and the stored progress_level detected by the reconciliation job.
+  // A sustained non-zero value indicates the indexer has missed milestone_approved
+  // events; run a reindex to resolve (see docs/runbook.md).
+  lines.push('# HELP scout_off_tier_divergence_total Total number of player tier divergence events detected since process start');
+  lines.push('# TYPE scout_off_tier_divergence_total counter');
+  lines.push(`scout_off_tier_divergence_total ${getTierDivergenceForMetrics()}`);
+
   return lines.join('\n') + '\n';
 }
 
@@ -442,9 +593,17 @@ export function serializeMetrics(extras: SerializeMetricsExtras = {}): string {
   * Builds the GET /metrics Express handler. The indexer-lag getter is injected so
   * this module never imports the indexer.
   */
-export function createMetricsHandler(getIndexerLedgerLag: () => number = () => 0, getSseConnectionsActive: () => number = () => 0) {
+export function createMetricsHandler(
+  getIndexerLedgerLag: () => number = () => 0,
+  getSseConnectionsActive: () => number = () => 0,
+  getStuckPinsCount: () => number = () => getStuckPendingPinsCount(),
+) {
   return (_req: Request, res: Response): void => {
     res.set('Content-Type', PROMETHEUS_CONTENT_TYPE);
-    res.send(serializeMetrics({ indexerLedgerLag: getIndexerLedgerLag(), sseConnectionsActive: getSseConnectionsActive() }));
+    res.send(serializeMetrics({
+      indexerLedgerLag: getIndexerLedgerLag(),
+      sseConnectionsActive: getSseConnectionsActive(),
+      stuckPendingPinsCount: getStuckPinsCount(),
+    }));
   };
 }

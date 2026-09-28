@@ -14,7 +14,7 @@ async function getValidatorToken(): Promise<string> {
   tx.sign(kp);
   const tokenRes = await request(app)
     .post('/auth/token')
-    .send({ transaction: tx.toXDR(), role: 'validator' });
+    .send({ transaction: tx.toXdr(), role: 'validator' });
   return tokenRes.body.token;
 }
 
@@ -68,7 +68,7 @@ describe('POST /api/validators/milestone — evidenceUri validation', () => {
       .send({ playerId: 'player-1', milestoneType: 'identity', evidenceUri: 'http://example.com/evidence' });
     expect(res.status).toBe(400);
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toBe('metadata_uri must be a valid IPFS CID (v0 or v1) or an HTTPS URL');
+    expect(res.body.details?.[0]?.message).toBe('metadata_uri must be a valid IPFS CID (v0 or v1) or an HTTPS URL');
   });
 
   it('returns 400 for a plain string URI', async () => {
@@ -99,7 +99,7 @@ describe('POST /api/validators/milestone — evidenceUri validation', () => {
       .send({ playerId: 'player-1', milestoneType: 'identity', evidenceUri: `ipfs://${VALID_CID_V0}` });
     expect(res.status).toBe(400);
     expect(res.body.success).toBe(false);
-    expect(res.body.error).toBe('metadata_uri must be a valid IPFS CID (v0 or v1) or an HTTPS URL');
+    expect(res.body.details?.[0]?.message).toBe('metadata_uri must be a valid IPFS CID (v0 or v1) or an HTTPS URL');
   });
 
   it('accepts a bare CIDv0 as evidenceUri', async () => {

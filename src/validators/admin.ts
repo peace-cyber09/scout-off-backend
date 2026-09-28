@@ -86,7 +86,7 @@ export const walletAddressSchema = z.object({
  */
 export const reindexSchema = z.object({
   fromLedger: z.coerce.number().int().min(0),
-});
+}).strict();
 
 /**
  * Schema for validator registration/revocation request body
@@ -94,7 +94,7 @@ export const reindexSchema = z.object({
  */
 export const validatorWalletSchema = z.object({
   validatorWallet: z.string().regex(STELLAR_ADDRESS_RE, 'Invalid Stellar address'),
-});
+}).strict();
 
 /**
  * Schema for fee withdrawal request body
@@ -102,7 +102,7 @@ export const validatorWalletSchema = z.object({
  */
 export const withdrawFeesSchema = z.object({
   recipient: z.string().regex(STELLAR_ADDRESS_RE, 'Invalid Stellar address'),
-});
+}).strict();
 
 /**
  * Schema for token introspection request body

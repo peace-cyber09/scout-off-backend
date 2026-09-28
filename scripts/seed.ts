@@ -39,8 +39,7 @@ if (!process.env.CONTRACT_ID)
   process.env.CONTRACT_ID = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
 if (!process.env.JWT_SECRET) process.env.JWT_SECRET = 'seed-script';
 
-import { initDb, getDb, insertOrUpdatePlayer, updatePlayerProgress } from '../src/db';
-import { runMigrations } from '../src/db/migrate';
+import { initDb, getDb, getDriver, insertOrUpdatePlayer, updatePlayerProgress } from '../src/db';
 
 // ─── Sample data ──────────────────────────────────────────────────────────────
 
@@ -300,10 +299,11 @@ function parseOnly(): Set<SeedType> | null {
 
 // ─── Seeding logic ────────────────────────────────────────────────────────────
 
-function seed(): void {
-  initDb();
+async function seed(): Promise<void> {
+  // initDb() already applies pending migrations internally — no separate
+  // runMigrations() call needed here.
+  await initDb();
   const db = getDb();
-  runMigrations(db);
 
   const only = parseOnly();
 
@@ -348,7 +348,7 @@ function seed(): void {
         skippedPlayers.push(p.player_id);
         continue;
       }
-      upsertPlayer({
+      await insertOrUpdatePlayer({
         player_id: p.player_id,
         wallet: p.wallet,
         position: p.position,
@@ -356,20 +356,9 @@ function seed(): void {
         metadata_uri: p.metadata_uri,
         created_at: p.created_at,
       });
-      updatePlayerProgress(p.player_id, p.progress_level);
+      await updatePlayerProgress(p.player_id, p.progress_level);
       insertedPlayers.push(p.player_id);
     }
-    insertOrUpdatePlayer({
-      player_id: p.player_id,
-      wallet: p.wallet,
-      position: p.position,
-      region: p.region,
-      metadata_uri: p.metadata_uri,
-      created_at: p.created_at,
-    });
-    updatePlayerProgress(p.player_id, p.progress_level);
-    insertedPlayers.push(p.player_id);
-  }
 
     console.log(`  Players   inserted=${insertedPlayers.length}  skipped=${skippedPlayers.length}`);
     if (insertedPlayers.length) console.log(`    + ${insertedPlayers.join(', ')}`);
@@ -412,4 +401,7 @@ function seed(): void {
   console.log(`    Scout Beta  (basic):   ${SCOUT_BETA}`);
 }
 
-seed();
+seed().catch((err) => {
+  console.error('Seed failed:', err);
+  process.exit(1);
+});

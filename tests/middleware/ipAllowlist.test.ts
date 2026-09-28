@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
-import { ipAllowlistMiddleware } from '../../src/middleware/ipAllowlist';
+import { ipAllowlistMiddleware, parseAllowlist } from '../../src/middleware/ipAllowlist';
+import { logger } from '../../src/utils/logger';
 
 /**
  * Build minimal mock req / res / next objects.
@@ -157,4 +158,177 @@ describe('ipAllowlistMiddleware', () => {
       error: 'Forbidden: IPv6 addresses are not supported by the IP allowlist',
     });
   });
+
+  // ------------------------------------------------------------------
+  // Test 7: Invalid CIDR entries log a startup warning but do not crash
+  // ------------------------------------------------------------------
+  it('logs a warning and skips invalid CIDR entries without crashing', () => {
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => false);
+
+    // "999.999.999.999/24" is not a valid CIDR; "10.0.0.1" is valid.
+    process.env.ADMIN_IP_ALLOWLIST = '999.999.999.999/24,10.0.0.1';
+
+    const { req, res, next } = makeReqRes('10.0.0.1');
+    expect(() => ipAllowlistMiddleware(req, res, next)).not.toThrow();
+
+    // Valid entry still allows the request through
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+
+    // A warning was logged for the invalid entry
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ entry: '999.999.999.999/24' })
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  it('logs a warning for an invalid plain IP entry', () => {
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => false);
+
+    process.env.ADMIN_IP_ALLOWLIST = 'not-an-ip,192.168.1.1';
+
+    const { req, res, next } = makeReqRes('192.168.1.1');
+    ipAllowlistMiddleware(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ entry: 'not-an-ip' })
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  it('calls next() when all entries are invalid (behaves as if allowlist is unset)', () => {
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => false);
+
+    process.env.ADMIN_IP_ALLOWLIST = 'bad-entry,also-bad';
+
+    const { req, res, next } = makeReqRes('1.2.3.4');
+    ipAllowlistMiddleware(req, res, next);
+
+    // Falls through to next() because the valid allowlist is empty
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+
+    warnSpy.mockRestore();
+  });
+
+  // ------------------------------------------------------------------
+  // Test 8: IPv4-mapped IPv6 addresses are handled transparently
+  // ------------------------------------------------------------------
+  it('allows an IPv4-mapped IPv6 address that matches a plain IPv4 allowlist entry', () => {
+    process.env.ADMIN_IP_ALLOWLIST = '10.0.0.5';
+
+    // ::ffff:10.0.0.5 is the IPv4-mapped IPv6 form of 10.0.0.5
+    const { req, res, next } = makeReqRes('::ffff:10.0.0.5');
+    ipAllowlistMiddleware(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it('allows an IPv4-mapped IPv6 address that falls within a CIDR range', () => {
+    process.env.ADMIN_IP_ALLOWLIST = '10.0.0.0/8';
+
+    const { req, res, next } = makeReqRes('::ffff:10.0.0.5');
+    ipAllowlistMiddleware(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it('blocks an IPv4-mapped IPv6 address outside the CIDR range', () => {
+    process.env.ADMIN_IP_ALLOWLIST = '192.168.1.0/24';
+
+    // ::ffff:10.0.0.5 → 10.0.0.5, which is outside 192.168.1.0/24
+    const { req, res, next } = makeReqRes('::ffff:10.0.0.5');
+    ipAllowlistMiddleware(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(403);
+  });
+
+  // ------------------------------------------------------------------
+  // Test 9: 10.0.0.5 matches 10.0.0.0/8 (acceptance criteria)
+  // ------------------------------------------------------------------
+  it('10.0.0.5 matches allowlist entry 10.0.0.0/8', () => {
+    process.env.ADMIN_IP_ALLOWLIST = '10.0.0.0/8';
+
+    const { req, res, next } = makeReqRes('10.0.0.5');
+    ipAllowlistMiddleware(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it('192.168.2.1 does not match 192.168.1.0/24 (acceptance criteria)', () => {
+    process.env.ADMIN_IP_ALLOWLIST = '192.168.1.0/24';
+
+    const { req, res, next } = makeReqRes('192.168.2.1');
+    ipAllowlistMiddleware(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(403);
+  });
 });
+
+// ------------------------------------------------------------------
+// parseAllowlist unit tests
+// ------------------------------------------------------------------
+describe('parseAllowlist', () => {
+  let warnSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => false);
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('returns valid exact IPs unchanged', () => {
+    const result = parseAllowlist('10.0.0.1,192.168.0.1');
+    expect(result).toEqual(['10.0.0.1', '192.168.0.1']);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('returns valid CIDR ranges unchanged', () => {
+    const result = parseAllowlist('10.0.0.0/8,192.168.1.0/24');
+    expect(result).toEqual(['10.0.0.0/8', '192.168.1.0/24']);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('filters out invalid entries and warns about each one', () => {
+    const result = parseAllowlist('bad,10.0.0.1,also-bad');
+    expect(result).toEqual(['10.0.0.1']);
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({ entry: 'bad' }));
+    expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({ entry: 'also-bad' }));
+  });
+
+  it('ignores whitespace-only entries without warning', () => {
+    const result = parseAllowlist('  ,10.0.0.1,  ');
+    expect(result).toEqual(['10.0.0.1']);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('returns empty array when all entries are invalid', () => {
+    const result = parseAllowlist('not-valid,999.0.0.0/99');
+    expect(result).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('accepts /0 prefix (match all IPv4)', () => {
+    const result = parseAllowlist('0.0.0.0/0');
+    expect(result).toEqual(['0.0.0.0/0']);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects prefix > 32', () => {
+    const result = parseAllowlist('10.0.0.0/33');
+    expect(result).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({ entry: '10.0.0.0/33' }));
+  });
+});
+

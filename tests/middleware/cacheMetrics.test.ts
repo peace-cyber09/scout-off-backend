@@ -16,6 +16,8 @@ import {
   recordCacheHit,
   recordCacheMiss,
   recordCacheEviction,
+  recordCacheInvalidation,
+  getCacheInvalidationTotal,
   serializeMetrics,
 } from '../../src/middleware/metrics';
 import { InMemoryCacheStore } from '../../src/services/inMemoryCacheStore';
@@ -118,6 +120,44 @@ describe('InMemoryCacheStore increments eviction counter on expired key read', (
     const result = await store.get<string>('never-set');
     expect(result).toBeUndefined();
     expect(getCacheMetrics().evictions).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cache_invalidation_total counter (#763)
+// ---------------------------------------------------------------------------
+
+describe('cache_invalidation_total counter', () => {
+  it('recordCacheInvalidation() increments the counter', () => {
+    recordCacheInvalidation();
+    recordCacheInvalidation();
+    expect(getCacheInvalidationTotal()).toBe(2);
+  });
+
+  it('counter starts at zero after resetMetrics()', () => {
+    recordCacheInvalidation();
+    resetMetrics();
+    expect(getCacheInvalidationTotal()).toBe(0);
+  });
+
+  it('invalidatePlayerCache() increments the counter once per invalidation', async () => {
+    await cacheModule.invalidatePlayerCache();
+    expect(getCacheInvalidationTotal()).toBe(1);
+    await cacheModule.invalidatePlayerCache('p1');
+    expect(getCacheInvalidationTotal()).toBe(2);
+  });
+
+  it('serializeMetrics() exposes cache_invalidation_total with HELP/TYPE lines', () => {
+    recordCacheInvalidation();
+    const output = serializeMetrics();
+    expect(output).toContain('cache_invalidation_total 1');
+    expect(output).toContain('# HELP cache_invalidation_total');
+    expect(output).toContain('# TYPE cache_invalidation_total counter');
+  });
+
+  it('emits zero when no invalidations have occurred', () => {
+    const output = serializeMetrics();
+    expect(output).toContain('cache_invalidation_total 0');
   });
 });
 

@@ -6,33 +6,42 @@
  * response is consistent with the player list endpoint.
  */
 import { Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
 import {
   getPlayerById,
   insertBookmark,
   deleteBookmark,
   getBookmarksByScout,
+  getBookmarkedPlayersWithDetails,
+  insertBookmarkFolder,
+  getBookmarkFoldersByScout,
+  getBookmarkFolderById,
+  deleteBookmarkFolder,
+  moveBookmarksToRoot,
+  countBookmarksInFolder,
   ScoutBookmarkRow,
+  ScoutBookmarkFolderRow,
   PlayerRow,
 } from '../db';
-import { isValidStellarAddress } from '../utils/stellarAddress';
-import { sendForbidden } from '../utils/authError';
 import { getTierMeta } from '../utils/tier';
 import { logger } from '../utils/logger';
 
-// ─── Ownership guard ──────────────────────────────────────────────────────────
+// ─── Validation ───────────────────────────────────────────────────────────────
 
-function assertWalletOwnership(req: Request, res: Response): boolean {
-  const { wallet } = req.params;
-  if (!isValidStellarAddress(wallet)) {
-    res.status(400).json({ success: false, error: 'Invalid Stellar address' });
-    return false;
-  }
-  if (req.account !== wallet) {
-    sendForbidden(res, 'Forbidden: wallet mismatch');
-    return false;
-  }
-  return true;
-}
+export const addBookmarkSchema = z.object({
+  playerId: z
+    .string({ required_error: 'playerId is required' })
+    .min(1, 'playerId is required'),
+  folderId: z.number().int().optional().nullable(),
+  note: z.string().max(2000).optional().nullable(),
+}).strict();
+
+export const createBookmarkFolderSchema = z.object({
+  name: z
+    .string({ required_error: 'name is required and must be a string' })
+    .min(1, 'name is required and must be a string')
+    .max(100),
+}).strict();
 
 // ─── Serialization (mirrors filterPlayers in playerController.ts) ─────────────
 
@@ -54,10 +63,11 @@ function serializePlayer(row: PlayerRow): Record<string, unknown> {
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /**
- * POST /api/scouts/:wallet/bookmarks/:playerId
+ * POST /api/scouts/:wallet/bookmarks
  *
- * Bookmark a player.  Idempotent — bookmarking an already-bookmarked player
- * returns 200 without creating a duplicate row.
+ * Bookmark a player with optional folder and note.  Idempotent — bookmarking an
+ * already-bookmarked player returns 200 without creating a duplicate row.
+ * Body: { playerId: string, folderId?: number, note?: string }
  * Returns 404 when the player does not exist in the local database.
  */
 export async function addBookmark(
@@ -65,40 +75,52 @@ export async function addBookmark(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
-  try {
-    if (!assertWalletOwnership(req, res)) return;
+  const { playerId, folderId, note } = req.body;
 
-    const { playerId } = req.params;
+  if (!playerId) {
+    res.status(400).json({ success: false, error: 'playerId is required' });
+    return;
+  }
 
-    // Verify the player exists
-    const player = getPlayerById(playerId);
-    if (!player) {
-      res.status(404).json({ success: false, error: 'Player not found' });
+  // Verify the player exists
+  const player = await getPlayerById(playerId);
+  if (!player) {
+    res.status(404).json({ success: false, error: 'Player not found' });
+    return;
+  }
+
+  // If folderId is provided, verify it belongs to the scout
+  if (folderId !== undefined && folderId !== null) {
+    const folder = await getBookmarkFolderById(folderId, req.params.wallet as string);
+    if (!folder) {
+      res.status(404).json({ success: false, error: 'Folder not found' });
       return;
     }
-
-    const now = Math.floor(Date.now() / 1000);
-    const inserted = insertBookmark({
-      scout_wallet: req.params.wallet,
-      player_id: playerId,
-      created_at: now,
-    });
-
-    if (inserted) {
-      logger.info({ scout: req.params.wallet, playerId, action: 'bookmark_added' });
-    }
-
-    res.status(200).json({
-      success: true,
-      data: {
-        scout_wallet: req.params.wallet,
-        player_id: playerId,
-        created_at: now,
-      },
-    });
-  } catch (err) {
-    next(err);
   }
+
+  const now = Math.floor(Date.now() / 1000);
+  const inserted = await insertBookmark({
+    scout_wallet: req.params.wallet as string,
+    player_id: playerId,
+    folder_id: folderId,
+    note: note || null,
+    created_at: now,
+  });
+
+  if (inserted) {
+    logger.info({ scout: req.params.wallet as string, playerId, folderId, action: 'bookmark_added' });
+  }
+
+  res.status(200).json({
+    success: true,
+    data: {
+      scout_wallet: req.params.wallet as string,
+      player_id: playerId,
+      folder_id: folderId || null,
+      note: note || null,
+      created_at: now,
+    },
+  });
 }
 
 /**
@@ -111,55 +133,151 @@ export async function removeBookmark(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
-  try {
-    if (!assertWalletOwnership(req, res)) return;
+  const {playerId} = req.params as {playerId: string};
+  const removed = await deleteBookmark(req.params.wallet as string, playerId);
 
-    const { playerId } = req.params;
-    const removed = deleteBookmark(req.params.wallet, playerId);
-
-    if (!removed) {
-      res.status(404).json({ success: false, error: 'Bookmark not found' });
-      return;
-    }
-
-    logger.info({ scout: req.params.wallet, playerId, action: 'bookmark_removed' });
-
-    res.json({ success: true, data: { removed: true, player_id: playerId } });
-  } catch (err) {
-    next(err);
+  if (!removed) {
+    res.status(404).json({ success: false, error: 'Bookmark not found' });
+    return;
   }
+
+  logger.info({ scout: req.params.wallet as string, playerId, action: 'bookmark_removed' });
+
+  res.json({ success: true, data: { removed: true, player_id: playerId } });
 }
 
 /**
  * GET /api/scouts/:wallet/bookmarks
  *
  * List all bookmarked players for the authenticated scout.
+ * Supports ?folderId= query parameter to filter by folder.
  * Returns full player profile summaries (same shape as the player list endpoint).
+ *
+ * Uses a single JOIN query (getBookmarkedPlayersWithDetails) instead of
+ * N separate getPlayerById() calls, so query count stays O(1) regardless
+ * of how many players the scout has bookmarked.
  */
 export async function listBookmarks(
   req: Request,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
-  try {
-    if (!assertWalletOwnership(req, res)) return;
+  const folderId = req.query.folderId ? parseInt(req.query.folderId as string, 10) : undefined;
 
-    const bookmarks: ScoutBookmarkRow[] = getBookmarksByScout(req.params.wallet);
+  // Single JOIN query — replaces the previous per-bookmark getPlayerById() loop.
+  const rows = await getBookmarkedPlayersWithDetails(req.params.wallet as string, folderId);
 
-    // Enrich with full player data
-    const enriched = bookmarks
-      .map((b) => {
-        const player = getPlayerById(b.player_id);
-        if (!player) return null;
-        return {
-          ...serializePlayer(player),
-          bookmarked_at: b.created_at,
-        };
-      })
-      .filter((p): p is NonNullable<typeof p> => p !== null);
+  const enriched = rows.map((row) => ({
+    ...serializePlayer(row),
+    bookmarked_at: row.bookmarked_at,
+    folder_id: row.bookmark_folder_id,
+    note: row.bookmark_note,
+  }));
 
-    res.json({ success: true, data: enriched });
-  } catch (err) {
-    next(err);
+  res.json({ success: true, data: enriched });
+}
+
+// ─── Bookmark folder handlers ─────────────────────────────────────────────────────
+
+/**
+ * POST /api/scouts/:wallet/bookmark-folders
+ *
+ * Create a new bookmark folder for the authenticated scout.
+ * Body: { name: string }
+ */
+export async function createBookmarkFolder(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const { name } = req.body;
+
+  if (!name || typeof name !== 'string') {
+    res.status(400).json({ success: false, error: 'name is required and must be a string' });
+    return;
   }
+
+  const now = Math.floor(Date.now() / 1000);
+  const folderId = await insertBookmarkFolder({
+    scout_wallet: req.params.wallet as string,
+    name,
+    created_at: now,
+  });
+
+  logger.info({ scout: req.params.wallet as string, folderId, name, action: 'folder_created' });
+
+  res.status(201).json({
+    success: true,
+    data: {
+      id: folderId,
+      scout_wallet: req.params.wallet as string,
+      name,
+      created_at: now,
+    },
+  });
+}
+
+/**
+ * GET /api/scouts/:wallet/bookmark-folders
+ *
+ * List all bookmark folders for the authenticated scout with bookmark counts.
+ */
+export async function listBookmarkFolders(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const folders: ScoutBookmarkFolderRow[] = await getBookmarkFoldersByScout(req.params.wallet as string);
+
+  // Enrich with bookmark counts
+  const enriched = await Promise.all(
+    folders.map(async (f) => ({
+      ...f,
+      bookmark_count: await countBookmarksInFolder(f.id),
+    })),
+  );
+
+  res.json({ success: true, data: enriched });
+}
+
+/**
+ * DELETE /api/scouts/:wallet/bookmark-folders/:folderId
+ *
+ * Delete a bookmark folder. Bookmarks in the folder are moved to root (folder_id set to NULL).
+ * Returns 404 when the folder does not exist or belongs to another scout.
+ */
+export async function deleteBookmarkFolderHandler(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  const {folderId} = req.params as {folderId: string};
+  const folderIdNum = parseInt(folderId, 10);
+
+  if (isNaN(folderIdNum)) {
+    res.status(400).json({ success: false, error: 'Invalid folderId' });
+    return;
+  }
+
+  // Verify folder exists and belongs to scout
+  const folder = await getBookmarkFolderById(folderIdNum, req.params.wallet as string);
+  if (!folder) {
+    res.status(404).json({ success: false, error: 'Folder not found' });
+    return;
+  }
+
+  // Move bookmarks to root before deleting folder
+  await moveBookmarksToRoot(folderIdNum, req.params.wallet as string);
+
+  // Delete the folder
+  const deleted = await deleteBookmarkFolder(folderIdNum, req.params.wallet as string);
+
+  if (!deleted) {
+    res.status(404).json({ success: false, error: 'Folder not found' });
+    return;
+  }
+
+  logger.info({ scout: req.params.wallet as string, folderId: folderIdNum, action: 'folder_deleted' });
+
+  res.json({ success: true, data: { deleted: true, folder_id: folderIdNum } });
 }

@@ -37,7 +37,7 @@ jest.mock('../../src/db', () => ({
   revokeApiKeyById: jest.fn(),
   getApiKeyByHash: jest.fn().mockReturnValue(null),
   getAllActiveApiKeys: jest.fn().mockReturnValue([]),
-  touchApiKeyLastUsed: jest.fn(),
+  touchApiKeyLastUsed: jest.fn().mockResolvedValue(undefined),
   // bookmarks
   insertBookmark: jest.fn(),
   deleteBookmark: jest.fn(),
@@ -46,6 +46,11 @@ jest.mock('../../src/db', () => ({
   insertSavedSearch: jest.fn(),
   getSavedSearchesByScout: jest.fn(),
   deleteSavedSearch: jest.fn(),
+  getSavedSearchById: jest.fn(),
+  updateSavedSearch: jest.fn(),
+  countSavedSearchesByScout: jest.fn().mockReturnValue(0),
+  queryPlayers: jest.fn().mockReturnValue([]),
+  countPlayers: jest.fn().mockReturnValue(0),
 }));
 
 jest.mock('../../src/services/stellar', () => ({
@@ -76,12 +81,22 @@ import {
   insertSavedSearch,
   getSavedSearchesByScout,
   deleteSavedSearch,
+  getSavedSearchById,
+  updateSavedSearch,
+  countSavedSearchesByScout,
+  queryPlayers,
+  countPlayers,
 } from '../../src/db';
 import { isFeatureEnabled } from '../../src/services/featureFlags';
 
 const mockInsertSavedSearch     = insertSavedSearch     as jest.Mock;
 const mockGetSavedSearches      = getSavedSearchesByScout as jest.Mock;
 const mockDeleteSavedSearch     = deleteSavedSearch     as jest.Mock;
+const mockGetSavedSearchById    = getSavedSearchById    as jest.Mock;
+const mockUpdateSavedSearch    = updateSavedSearch    as jest.Mock;
+const mockCountSavedSearches    = countSavedSearchesByScout as jest.Mock;
+const mockQueryPlayers         = queryPlayers         as jest.Mock;
+const mockCountPlayers         = countPlayers         as jest.Mock;
 const mockIsFeatureEnabled      = isFeatureEnabled      as jest.Mock;
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
@@ -258,6 +273,20 @@ describe('POST /api/scouts/:wallet/saved-searches', () => {
       .send({ name: 'Test', filters: VALID_FILTERS });
 
     expect(res.status).toBe(403);
+    expect(mockInsertSavedSearch).not.toHaveBeenCalled();
+  });
+
+  it('returns 422 when scout has 20 saved searches', async () => {
+    mockCountSavedSearches.mockReturnValueOnce(20);
+
+    const res = await request(app)
+      .post(`/api/scouts/${SCOUT_A}/saved-searches`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ name: 'Test', filters: VALID_FILTERS });
+
+    expect(res.status).toBe(422);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe('Maximum of 20 saved searches per scout');
     expect(mockInsertSavedSearch).not.toHaveBeenCalled();
   });
 });
@@ -527,7 +556,7 @@ describe('saved searches feature flag (#494)', () => {
   });
 
   it('returns 404 when the saved_searches flag is disabled (POST)', async () => {
-    mockIsFeatureEnabled.mockReturnValue(false);
+    mockIsFeatureEnabled.mockReturnValueOnce(false);
 
     const res = await request(app)
       .post(`/api/scouts/${SCOUT_A}/saved-searches`)
@@ -540,7 +569,7 @@ describe('saved searches feature flag (#494)', () => {
   });
 
   it('returns 404 when the saved_searches flag is disabled (GET)', async () => {
-    mockIsFeatureEnabled.mockReturnValue(false);
+    mockIsFeatureEnabled.mockReturnValueOnce(false);
 
     const res = await request(app)
       .get(`/api/scouts/${SCOUT_A}/saved-searches`)
@@ -552,7 +581,7 @@ describe('saved searches feature flag (#494)', () => {
   });
 
   it('returns 404 when the saved_searches flag is disabled (DELETE)', async () => {
-    mockIsFeatureEnabled.mockReturnValue(false);
+    mockIsFeatureEnabled.mockReturnValueOnce(false);
 
     const res = await request(app)
       .delete(`/api/scouts/${SCOUT_A}/saved-searches/1`)
@@ -561,5 +590,163 @@ describe('saved searches feature flag (#494)', () => {
     expect(res.status).toBe(404);
     expect(res.body.code).toBe('FEATURE_DISABLED');
     expect(mockDeleteSavedSearch).not.toHaveBeenCalled();
+  });
+});
+
+// ─── PUT /api/scouts/:wallet/saved-searches/:id ───────────────────────────────────
+
+describe('PUT /api/scouts/:wallet/saved-searches/:id', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('updates a saved search name and returns 200', async () => {
+    mockUpdateSavedSearch.mockReturnValueOnce(true);
+    mockGetSavedSearchById.mockReturnValueOnce({
+      ...MOCK_ROW,
+      name: 'Updated name',
+    });
+
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/saved-searches/1`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ name: 'Updated name' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.name).toBe('Updated name');
+    expect(mockUpdateSavedSearch).toHaveBeenCalledWith(1, SCOUT_A, { name: 'Updated name' });
+  });
+
+  it('updates a saved search filters and returns 200', async () => {
+    mockUpdateSavedSearch.mockReturnValueOnce(true);
+    mockGetSavedSearchById.mockReturnValueOnce({
+      ...MOCK_ROW,
+      filters: JSON.stringify({ region: 'East Africa' }),
+    });
+
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/saved-searches/1`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ filters: { region: 'East Africa' } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.filters).toEqual({ region: 'East Africa' });
+  });
+
+  it('returns 404 when saved search does not exist', async () => {
+    mockUpdateSavedSearch.mockReturnValueOnce(false);
+
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/saved-searches/999`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ name: 'Updated' });
+
+    expect(res.status).toBe(404);
+    expect(res.body.success).toBe(false);
+  });
+
+  it('returns 400 when id is not a number', async () => {
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_A}/saved-searches/notanumber`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ name: 'Updated' });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 403 when wallet mismatch', async () => {
+    const res = await request(app)
+      .put(`/api/scouts/${SCOUT_B}/saved-searches/1`)
+      .set('Authorization', `Bearer ${scoutAToken}`)
+      .send({ name: 'Updated' });
+
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─── GET /api/scouts/:wallet/saved-searches/:id/run ────────────────────────────────
+
+describe('GET /api/scouts/:wallet/saved-searches/:id/run', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('runs a saved search and returns players', async () => {
+    mockGetSavedSearchById.mockReturnValueOnce(MOCK_ROW);
+    mockQueryPlayers.mockReturnValueOnce([]);
+    mockCountPlayers.mockReturnValueOnce(0);
+
+    const res = await request(app)
+      .get(`/api/scouts/${SCOUT_A}/saved-searches/1/run`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.players).toEqual([]);
+    expect(res.body.data.total).toBe(0);
+    expect(res.body.data.page).toBe(1);
+    expect(res.body.data.pageSize).toBe(20);
+  });
+
+  it('passes saved filters to queryPlayers', async () => {
+    mockGetSavedSearchById.mockReturnValueOnce(MOCK_ROW);
+    mockQueryPlayers.mockReturnValueOnce([]);
+    mockCountPlayers.mockReturnValueOnce(0);
+
+    await request(app)
+      .get(`/api/scouts/${SCOUT_A}/saved-searches/1/run`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+
+    expect(mockQueryPlayers).toHaveBeenCalledWith({
+      region: 'West Africa',
+      position: 'Forward',
+      minTier: 2,
+      limit: 20,
+      offset: 0,
+    });
+  });
+
+  it('supports pagination params', async () => {
+    mockGetSavedSearchById.mockReturnValueOnce(MOCK_ROW);
+    mockQueryPlayers.mockReturnValueOnce([]);
+    mockCountPlayers.mockReturnValueOnce(0);
+
+    const res = await request(app)
+      .get(`/api/scouts/${SCOUT_A}/saved-searches/1/run?page=2&pageSize=50`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.page).toBe(2);
+    expect(res.body.data.pageSize).toBe(50);
+    expect(mockQueryPlayers).toHaveBeenCalledWith(
+      expect.objectContaining({
+        limit: 50,
+        offset: 50,
+      })
+    );
+  });
+
+  it('returns 404 when saved search does not exist', async () => {
+    mockGetSavedSearchById.mockReturnValueOnce(null);
+
+    const res = await request(app)
+      .get(`/api/scouts/${SCOUT_A}/saved-searches/999/run`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+
+    expect(res.status).toBe(404);
+    expect(res.body.success).toBe(false);
+  });
+
+  it('returns 400 when id is not a number', async () => {
+    const res = await request(app)
+      .get(`/api/scouts/${SCOUT_A}/saved-searches/notanumber/run`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 403 when wallet mismatch', async () => {
+    const res = await request(app)
+      .get(`/api/scouts/${SCOUT_B}/saved-searches/1/run`)
+      .set('Authorization', `Bearer ${scoutAToken}`);
+
+    expect(res.status).toBe(403);
   });
 });

@@ -1,7 +1,30 @@
+// This suite seeds real rows and asserts on real query results (row counts,
+// cursor ordering, CSV content), so it needs the actual better-sqlite3
+// implementation rather than the project's global manual mock
+// (__mocks__/better-sqlite3.js — a stub whose queries always return
+// undefined/[], added for environments where the native binding can't be
+// built). `jest.unmock` alone isn't enough here: the global setupFile
+// (tests/setup.ts) already called initDb() — using the mock, since it runs
+// before this file loads — and captured the mocked instance in src/db's
+// module-level state. `jest.resetModules()` plus a fresh `require` gives
+// this file its own instance of src/db (and, transitively, of
+// exportController) built against the real better-sqlite3, re-initialized
+// below. This is scoped to this file only — every other test file keeps
+// using the shared mocked instance from tests/setup.ts and is unaffected.
+jest.unmock('better-sqlite3');
+jest.resetModules();
+
 import { EventEmitter } from 'events';
 import { Request, Response, NextFunction } from 'express';
-import { exportEvents } from '../../src/controllers/exportController';
-import * as db from '../../src/db';
+import type * as DbModule from '../../src/db';
+import type * as ExportControllerModule from '../../src/controllers/exportController';
+
+const db: typeof DbModule = require('../../src/db');
+const { exportEvents }: typeof ExportControllerModule = require('../../src/controllers/exportController');
+
+beforeAll(async () => {
+  await db.initDb();
+});
 
 const TOTAL_EVENTS = 5001;
 
@@ -440,6 +463,69 @@ describe('GET /api/admin/events/export — CSV escaping', () => {
   });
 });
 
+describe('GET /api/admin/events/export — CSV formula injection prevention (OWASP)', () => {
+  it('neutralizes a field starting with = (formula trigger)', () => {
+    const { csvEscapeField } = require('../../src/controllers/exportController');
+    const result = csvEscapeField('=1+1');
+    // Must NOT start with = in the output
+    expect(result.replace(/^"/, '')).not.toMatch(/^=/);
+    // Must be quoted because the prepended tab is a special character
+    expect(result.startsWith('"')).toBe(true);
+  });
+
+  it('neutralizes a field starting with + (formula trigger)', () => {
+    const { csvEscapeField } = require('../../src/controllers/exportController');
+    const result = csvEscapeField('+cmd|"/C calc"!A0');
+    expect(result.replace(/^"/, '')).not.toMatch(/^\+/);
+    expect(result.startsWith('"')).toBe(true);
+  });
+
+  it('neutralizes a field starting with - (formula trigger)', () => {
+    const { csvEscapeField } = require('../../src/controllers/exportController');
+    const result = csvEscapeField('-2+3');
+    expect(result.replace(/^"/, '')).not.toMatch(/^-/);
+    expect(result.startsWith('"')).toBe(true);
+  });
+
+  it('neutralizes a field starting with @ (formula trigger)', () => {
+    const { csvEscapeField } = require('../../src/controllers/exportController');
+    const result = csvEscapeField('@SUM(A1:A100)');
+    expect(result.replace(/^"/, '')).not.toMatch(/^@/);
+    expect(result.startsWith('"')).toBe(true);
+  });
+
+  it('does not alter a normal field that does not start with a trigger character', () => {
+    const { csvEscapeField } = require('../../src/controllers/exportController');
+    expect(csvEscapeField('player_registered')).toBe('player_registered');
+    expect(csvEscapeField('hello world')).toBe('hello world');
+    expect(csvEscapeField('123')).toBe('123');
+  });
+
+  it('round-trips a formula-injection payload through formatEventCsvRow and back via the CSV parser', async () => {
+    const { formatEventCsvRow } = require('../../src/controllers/exportController');
+    // A payload where the JSON-encoded value starts with = (formula trigger)
+    const row = {
+      type: '=HYPERLINK("http://evil.example","click me")' as const,
+      ledger: 42,
+      createdAt: 1_700_000_000_000,
+      payload: { cmd: '=1+1' },
+    };
+    const line = formatEventCsvRow(row);
+    const parsed = parseCsv(line);
+
+    expect(parsed.length).toBe(1);
+    expect(parsed[0].length).toBe(4);
+
+    // event_type field — starts with = but neutralized; the parsed value
+    // should not begin with = (it is prefixed by a tab by the sanitizer)
+    expect(parsed[0][0]).not.toMatch(/^=/);
+
+    // payload field — JSON.stringify of {cmd:'=1+1'} does NOT start with =
+    // (it starts with {), so no formula trigger — value is preserved as-is
+    expect(JSON.parse(parsed[0][3])).toEqual(row.payload);
+  });
+});
+
 describe('GET /api/admin/events/export — client abort cleanup', () => {
   it('cleans up the SQLite cursor when the client disconnects mid-stream', async () => {
     const { PassThrough } = await import('stream');
@@ -476,5 +562,116 @@ describe('GET /api/admin/events/export — client abort cleanup', () => {
 
     await expect(exportPromise).resolves.toBeUndefined();
     expect(next).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/admin/events/export — disconnect check without backpressure (#680)', () => {
+  const DISCONNECT_TYPE = 'disconnect_check_event';
+  const DISCONNECT_TOTAL = 5000;
+  const DISCONNECT_AFTER_ROW = 50;
+
+  beforeAll(() => {
+    const insert = db.getDb().prepare(
+      'INSERT OR IGNORE INTO events (type, ledger, tx_hash, payload, created_at) VALUES (?, ?, ?, ?, ?)'
+    );
+    const insertMany = db.getDb().transaction((rows: Array<[string, number, string, string, number]>) => {
+      for (const row of rows) insert.run(...row);
+    });
+
+    const rows: Array<[string, number, string, string, number]> = [];
+    for (let i = 0; i < DISCONNECT_TOTAL; i++) {
+      rows.push([
+        DISCONNECT_TYPE,
+        4_000_000 + i,
+        `disconnect-check-tx-${i}`,
+        JSON.stringify({ i }),
+        Date.UTC(2025, 5, 1, 0, 0, i),
+      ]);
+    }
+    insertMany(rows);
+  });
+
+  it('stops fetching further rows once the client disconnects, even when writes never hit backpressure', async () => {
+    // Wrap the real generator so we can count how many rows are actually
+    // pulled off the SQLite cursor — the thing #680 asks us to prove stops,
+    // as distinct from merely observing a shorter HTTP response body.
+    let cursorAdvances = 0;
+    const realGetEventsIterable = db.getEventsIterable;
+    const spy = jest
+      .spyOn(db, 'getEventsIterable')
+      .mockImplementation(function* (...args: Parameters<typeof db.getEventsIterable>) {
+        for (const row of realGetEventsIterable(...args)) {
+          cursorAdvances++;
+          yield row;
+        }
+      });
+
+    const req = Object.assign(new EventEmitter(), {
+      query: { eventType: DISCONNECT_TYPE },
+    }) as unknown as Request;
+
+    // makeStreamingRes()'s write() always returns true — no backpressure is
+    // ever signalled, which is exactly the case #680 describes (a fast
+    // client, or small enough rows, that never fills the socket buffer).
+    // Without the periodic check this loop would run to completion fully
+    // synchronously regardless of when 'close' fires.
+    const { res, getBody } = makeStreamingRes();
+    const originalWrite = res.write as jest.Mock;
+    let dataRowsWritten = 0;
+    (res as unknown as { write: jest.Mock }).write = jest.fn((chunk: string) => {
+      const isDataRow = chunk !== 'event_type,ledger,timestamp,payload\n' && !chunk.startsWith('__EOF__');
+      if (isDataRow) {
+        dataRowsWritten++;
+        if (dataRowsWritten === DISCONNECT_AFTER_ROW) {
+          req.emit('close');
+        }
+      }
+      return originalWrite(chunk);
+    });
+
+    const next = jest.fn() as NextFunction;
+    await exportEvents(req, res, next);
+
+    spy.mockRestore();
+
+    // The cursor must have stopped well short of the full seeded set —
+    // proving the disconnect check actually halted DB work, not just that
+    // the HTTP response happened to end early.
+    expect(cursorAdvances).toBeGreaterThanOrEqual(DISCONNECT_AFTER_ROW);
+    expect(cursorAdvances).toBeLessThan(DISCONNECT_TOTAL);
+
+    // No further cursor advances happen after exportEvents() has returned.
+    const stoppedAt = cursorAdvances;
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(cursorAdvances).toBe(stoppedAt);
+
+    // The export must not have completed normally: no EOF footer, and the
+    // error path was never invoked.
+    expect(getBody()).not.toContain('__EOF__');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('completes normally (no premature stop) when the client never disconnects', async () => {
+    let cursorAdvances = 0;
+    const realGetEventsIterable = db.getEventsIterable;
+    const spy = jest
+      .spyOn(db, 'getEventsIterable')
+      .mockImplementation(function* (...args: Parameters<typeof db.getEventsIterable>) {
+        for (const row of realGetEventsIterable(...args)) {
+          cursorAdvances++;
+          yield row;
+        }
+      });
+
+    const req = { query: { eventType: DISCONNECT_TYPE } } as unknown as Request;
+    const { res, getBody, isEnded } = makeStreamingRes();
+    const next = jest.fn() as NextFunction;
+
+    await exportEvents(req, res, next);
+    spy.mockRestore();
+
+    expect(cursorAdvances).toBe(DISCONNECT_TOTAL);
+    expect(isEnded()).toBe(true);
+    expect(getBody()).toContain(`__EOF__,${DISCONNECT_TOTAL},,`);
   });
 });

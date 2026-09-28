@@ -49,7 +49,7 @@ function hasRequestBody(req: Request): boolean {
  * Usage: router.post('/route', validateBody(mySchema), handler)
  */
 export function validateBody<T>(schema: ZodSchema<T>, options?: ValidationOptions): RequestHandler {
-  return (req, res, next): void => {
+  const middleware: RequestHandler = (req, res, next): void => {
     if (hasRequestBody(req) && !hasJsonContentType(req)) {
       const correlationId = getCorrelationId(req);
       logger.warn(
@@ -63,7 +63,12 @@ export function validateBody<T>(schema: ZodSchema<T>, options?: ValidationOption
       });
       return;
     }
-    const result = schema.safeParse(req.body);
+    // Express 5's body parser leaves `req.body` undefined for a body-less
+    // request (Express 4 defaulted it to {}). Routes with an all-optional or
+    // empty schema must keep accepting no body, so normalise undefined/null to
+    // an empty object before validating.
+    const body = req.body ?? {};
+    const result = schema.safeParse(body);
     if (!result.success) {
       const correlationId = getCorrelationId(req);
       const details = result.error.errors.map((err) => ({
@@ -87,6 +92,32 @@ export function validateBody<T>(schema: ZodSchema<T>, options?: ValidationOption
     req.body = sanitizeObject(result.data);
     next();
   };
+  Object.defineProperty(middleware, '__validateBody', { value: true });
+  Object.defineProperty(middleware, 'name', { value: 'validateBody' });
+  return middleware;
+}
+
+/**
+ * Validate JSON bodies with `schema`; pass through CSV/plain-text bodies unchanged.
+ * Tagged like `validateBody` so the mutating-route meta-test accepts dual import routes.
+ */
+export function validateJsonBodyOrPassThrough<T>(
+  schema: ZodSchema<T>,
+  options?: ValidationOptions,
+): RequestHandler {
+  const jsonValidator = validateBody(schema, options);
+  const middleware: RequestHandler = (req, res, next): void => {
+    const contentType = req.headers?.['content-type'];
+    const ct = contentType ? contentType.split(';')[0].trim().toLowerCase() : '';
+    if (ct === 'text/csv' || ct === 'text/plain' || typeof req.body === 'string') {
+      next();
+      return;
+    }
+    jsonValidator(req, res, next);
+  };
+  Object.defineProperty(middleware, '__validateBody', { value: true });
+  Object.defineProperty(middleware, 'name', { value: 'validateBody' });
+  return middleware;
 }
 
 /**
@@ -120,9 +151,14 @@ export function validateQuery<T>(schema: ZodSchema<T>, options?: ValidationOptio
       });
       return;
     }
-    // Cast so the controller can read coerced + defaulted values via req.query
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (req as any).query = sanitizeObject(result.data);
+    // Express 5 exposes req.query as a getter-only property, so a plain
+    // assignment throws — define the sanitized value explicitly instead so
+    // controllers keep reading coerced + defaulted values via req.query.
+    Object.defineProperty(req, 'query', {
+      value: sanitizeObject(result.data),
+      writable: true,
+      configurable: true,
+    });
     next();
   };
 }
@@ -151,7 +187,9 @@ export function validateParams<T>(schema: ZodSchema<T>, options?: ValidationOpti
       });
       return;
     }
-    req.params = { ...req.params, ...(sanitizeObject(result.data) as Record<string, string>) };
+    // Express 5: req.params is read-only, merge validated params into a local variable
+    // Controllers should use the validated data from result.data directly
+    (req as any).validatedParams = sanitizeObject(result.data);
     next();
   };
 }

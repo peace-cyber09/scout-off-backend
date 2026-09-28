@@ -11,6 +11,7 @@ import { z } from 'zod';
 import {
   startReindex,
   getReindexStatus,
+  cancelReindex,
   MAX_REINDEX_RANGE,
   ReindexAlreadyRunningError,
 } from '../services/reindexService';
@@ -19,7 +20,13 @@ import { ErrorCode } from '../utils/errorCodes';
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
-const reindexBodySchema = z
+/**
+ * Structural body schema (field types only, no cross-field range rules).
+ * Used by the route-level validateBody() so it rejects malformed payloads with
+ * 400 but lets range violations through to triggerReindex(), which classifies
+ * an over-limit range as 422 (see the safeParse in that handler).
+ */
+export const reindexBodyShapeSchema = z
   .object({
     fromLedger: z
       .number({ required_error: 'fromLedger is required' })
@@ -30,12 +37,19 @@ const reindexBodySchema = z
       .int('toLedger must be an integer')
       .min(1, 'toLedger must be ≥ 1'),
   })
+  .strict();
+
+export const reindexBodySchema = reindexBodyShapeSchema
   .refine((d) => d.fromLedger < d.toLedger, {
     message: 'fromLedger must be less than toLedger',
     path: ['fromLedger'],
   })
   .refine((d) => d.toLedger - d.fromLedger <= MAX_REINDEX_RANGE, {
-    message: `Ledger range must not exceed ${MAX_REINDEX_RANGE} ledgers`,
+    // Formatted with a space thousands separator ("10 000") to match the
+    // classification check below, which looks for that exact substring to
+    // tell a range-too-large error (→ 422) apart from other validation
+    // failures (→ 400).
+    message: 'Ledger range must not exceed 10 000 ledgers',
     path: ['toLedger'],
   });
 
@@ -60,7 +74,7 @@ export function triggerReindex(
   res: Response,
   next: NextFunction,
 ): void {
-  try {
+try {
     const parsed = reindexBodySchema.safeParse(req.body);
     if (!parsed.success) {
       const firstError = parsed.error.errors[0];
@@ -130,20 +144,65 @@ export function reindexStatusHandler(
   res: Response,
   next: NextFunction,
 ): void {
+  const s = getReindexStatus();
+  res.json({
+    success: true,
+    data: {
+      status: s.status,
+      from_ledger: s.fromLedger,
+      to_ledger: s.toLedger,
+      ledgers_processed: s.ledgersProcessed,
+      ledgers_total: s.ledgersTotal,
+      events_inserted: s.eventsInserted,
+      started_at: s.startedAt,
+      completed_at: s.completedAt,
+      error_message: s.errorMessage,
+    },
+  });
+}
+
+// ── POST /api/admin/reindex/cancel ────────────────────────────────────────────
+
+/**
+ * Cooperatively cancel the currently running background reindex job.
+ *
+ * Sets a module-level cancel flag that the batch loop checks after each
+ * batch. The job transitions to 'cancelled' within one batch iteration and
+ * persists the last-processed ledger for auditing.
+ *
+ * NOTE: This is a process-local flag. For multi-instance deployments a shared
+ * flag (e.g. Redis) would be required — this is labelled as a first step.
+ *
+ * @response 200 { success: true, data: { status: 'cancel_requested', message } }
+ * @response 409 { success: false, error: string } - no job is running
+ * @auth Bearer (admin role required)
+ */
+export function cancelReindexHandler(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
   try {
-    const s = getReindexStatus();
+    const adminWallet = req.account ?? 'unknown';
+    const wasCancelled = cancelReindex(adminWallet);
+
+    if (!wasCancelled) {
+      res.status(409).json({
+        success: false,
+        error: 'No reindex job is currently running.',
+        code: ErrorCode.CONFLICT,
+      });
+      return;
+    }
+
+    logger.info(`[reindex] cancel acknowledged by admin=${adminWallet}`);
+
     res.json({
       success: true,
       data: {
-        status: s.status,
-        from_ledger: s.fromLedger,
-        to_ledger: s.toLedger,
-        ledgers_processed: s.ledgersProcessed,
-        ledgers_total: s.ledgersTotal,
-        events_inserted: s.eventsInserted,
-        started_at: s.startedAt,
-        completed_at: s.completedAt,
-        error_message: s.errorMessage,
+        status: 'cancel_requested',
+        message:
+          'Cancellation requested. The job will stop after the current batch completes.',
       },
     });
   } catch (err) {

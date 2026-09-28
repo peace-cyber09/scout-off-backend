@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
+soroban-sdk = { workspace = true }
 scout-off-shared = { path = "../shared" }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]

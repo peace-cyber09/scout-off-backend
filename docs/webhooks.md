@@ -25,6 +25,7 @@ On every indexed contract event, the backend POSTs:
 
 ```json
 {
+  "deliveryId": "550e8400-e29b-41d4-a716-446655440000",
   "eventType": "player_registered",
   "payload": { "...": "..." }
 }
@@ -37,8 +38,230 @@ Content-Type: application/json
 X-Webhook-Signature: sha256=<hex-encoded HMAC-SHA256 digest>
 ```
 
+The `deliveryId` field is a UUID v4 generated once per logical delivery. It
+is included in the signed body, so a receiver can trust it is authentic and
+unmodified. The same `deliveryId` is reused across dead-letter replays of
+the same logical delivery, enabling receiver-side deduplication.
+
+**Migration note (existing subscribers):** The payload shape has changed from
+`{ eventType, payload }` to `{ deliveryId, eventType, payload }`. Existing
+subscribers that destructure only `eventType` and `payload` will continue to
+work — the new `deliveryId` field is additive and does not break existing
+code that ignores unknown keys. Subscribers that validate the payload shape
+(e.g. strict JSON Schema validation) must update their schema to accept the
+new field.
+
 Delivery uses exponential backoff (3 attempts by default: 500ms, then 1000ms
 between attempts) via `postWebhookWithRetry` in `src/services/webhooks.ts`.
+Each individual attempt is bounded by `WEBHOOK_TIMEOUT_MS` (default: 10s) — a
+subscriber that accepts the connection but never responds is aborted and the
+attempt treated as a failure, rather than hanging indefinitely (#691).
+
+## Events
+
+Every dispatched delivery wraps the event-specific payload in the same
+envelope:
+
+```json
+{
+  "deliveryId": "550e8400-e29b-41d4-a716-446655440000",
+  "eventType": "<event type name>",
+  "payload": { "...": "..." }
+}
+```
+
+`deliveryId` is a UUID v4, stable across dead-letter replays of the same
+logical delivery — see [Receiver-side deduplication](#receiver-side-deduplication)
+for how to use it to dedupe. `eventType` is one of the values below, and
+`payload` is normalized by the indexer (`normalizePayload()` in
+`src/services/indexer.ts`) so every field is `snake_case` regardless of the
+casing the contract emitted.
+
+### `player_registered`
+
+Fires when a player registers a new on-chain profile (`POST /api/players`,
+or the admin bulk-import endpoints).
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `player_id` | string | Newly generated player ID |
+| `wallet` | string | Player's Stellar wallet address |
+| `position` | string \| undefined | Playing position |
+| `region` | string \| undefined | Player's region |
+| `metadataUri` | string \| undefined | IPFS URI for off-chain profile metadata |
+
+```json
+{
+  "deliveryId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "eventType": "player_registered",
+  "payload": {
+    "player_id": "player-abc123",
+    "wallet": "GABCDE...",
+    "position": "Forward",
+    "region": "West Africa",
+    "metadataUri": "ipfs://bafy.../profile.json"
+  }
+}
+```
+
+### `milestone_submitted`
+
+Fires when a validator submits a milestone for a player on-chain; indexed
+from the Soroban contract event.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `milestone_id` | string | On-chain milestone ID |
+| `player_id` | string | Player the milestone belongs to |
+| `validator` | string | Validator's wallet address |
+| `milestone_type` | string | Milestone category |
+| `evidence_uri` | string | IPFS URI for supporting evidence |
+
+```json
+{
+  "deliveryId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "eventType": "milestone_submitted",
+  "payload": {
+    "milestone_id": "milestone-001",
+    "player_id": "player-abc123",
+    "validator": "GVALID...",
+    "milestone_type": "match_performance",
+    "evidence_uri": "ipfs://bafy.../evidence.json"
+  }
+}
+```
+
+### `milestone_approved`
+
+Fires when a submitted milestone is approved on-chain; indexed from the
+Soroban contract event. Approval count drives the player's progress tier
+(`tierForApprovedMilestones()`).
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `player_id` | string | Player whose milestone was approved |
+| `milestone_id` | string | Approved milestone ID |
+| `validator` | string \| undefined | Approving validator's wallet |
+
+```json
+{
+  "deliveryId": "16fd2706-8baf-433b-82eb-8c7fada847da",
+  "eventType": "milestone_approved",
+  "payload": {
+    "player_id": "player-abc123",
+    "milestone_id": "milestone-001",
+    "validator": "GVALID..."
+  }
+}
+```
+
+### `scout_subscribed`
+
+Fires when a scout purchases or renews a subscription tier.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `scout` | string | Scout's wallet address |
+| `tier` | string | Subscription tier purchased |
+| `expires_at` | number | Unix timestamp when the subscription expires |
+| `tx_hash` | string | Stellar transaction hash |
+| `timestamp` | string | ISO 8601 timestamp of the event |
+
+```json
+{
+  "deliveryId": "9b2d1c4a-1111-4a22-9c3d-5f6a7b8c9d0e",
+  "eventType": "scout_subscribed",
+  "payload": {
+    "scout": "GSCOUT...",
+    "tier": "premium",
+    "expires_at": 1785000000,
+    "tx_hash": "abcdef0123...",
+    "timestamp": "2026-07-21T00:00:00.000Z"
+  }
+}
+```
+
+### `contact_unlocked`
+
+Fires when a scout pays the contact fee to unlock a player's contact
+details.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `scout` | string | Scout's wallet address |
+| `player_id` | string | Player whose contact was unlocked |
+| `tx_hash` | string | Stellar transaction hash |
+| `timestamp` | string | ISO 8601 timestamp of the event |
+
+```json
+{
+  "deliveryId": "2e1f3a4b-2222-4b33-8d4e-6a7b8c9d0e1f",
+  "eventType": "contact_unlocked",
+  "payload": {
+    "scout": "GSCOUT...",
+    "player_id": "player-abc123",
+    "tx_hash": "abcdef0123...",
+    "timestamp": "2026-07-21T00:00:00.000Z"
+  }
+}
+```
+
+### `trial_offer_logged`
+
+Fires when a scout submits a trial offer for a player.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `offer_id` | string | Generated trial offer ID |
+| `scout` | string | Scout's wallet address |
+| `player_id` | string | Player the offer is for |
+| `details_uri` | string | IPFS URI with offer details |
+| `tx_hash` | string | Stellar transaction hash |
+| `timestamp` | string | ISO 8601 timestamp of the event |
+
+```json
+{
+  "deliveryId": "4d5e6f70-3333-4c44-9e5f-7b8c9d0e1f2a",
+  "eventType": "trial_offer_logged",
+  "payload": {
+    "offer_id": "offer-1785000000-player-abc123",
+    "scout": "GSCOUT...",
+    "player_id": "player-abc123",
+    "details_uri": "ipfs://bafy.../offer.json",
+    "tx_hash": "abcdef0123...",
+    "timestamp": "2026-07-21T00:00:00.000Z"
+  }
+}
+```
+
+### `fees_withdrawn`
+
+Fires when an admin withdraws accumulated platform fees from the contract.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `recipient` | string | Wallet address the fees were withdrawn to |
+| `amount` | string | Amount withdrawn |
+| `token` | string | Token/asset withdrawn (e.g. `XLM`) |
+
+```json
+{
+  "deliveryId": "5e6f7081-4444-4d55-af60-8c9d0e1f2a3b",
+  "eventType": "fees_withdrawn",
+  "payload": {
+    "recipient": "GADMIN...",
+    "amount": "12500000",
+    "token": "XLM"
+  }
+}
+```
+
+> **Note:** `player_registered`, `milestone_submitted`, and `milestone_approved`
+> are the event types currently wired to outbound HTTP webhook dispatch
+> (`dispatchEventWebhook()`); `scout_subscribed`, `contact_unlocked`,
+> `trial_offer_logged`, and `fees_withdrawn` are indexed the same way and
+> broadcast over the SSE event stream (`src/services/eventBroadcaster.ts`),
+> but are not yet wired to outbound webhook delivery.
 
 ## Verifying the signature
 
@@ -51,7 +274,8 @@ sha256=HMAC_SHA256(secret, raw_request_body_bytes)
 The HMAC is computed over the **raw bytes of the request body exactly as
 sent** — do not re-serialize the parsed JSON before verifying, since
 key ordering/whitespace differences would produce a different digest than
-what was signed.
+what was signed. The `deliveryId` field is part of the signed body, so
+a receiver can rely on it being authentic.
 
 This mirrors the pattern used by Stripe and GitHub webhooks: recompute the
 HMAC yourself with your subscription's secret, and compare it to the value in
@@ -95,20 +319,90 @@ Note the receiver must read the **raw body** (e.g. `express.raw()`) for the
 signature check — parsing JSON first and re-stringifying it is not
 guaranteed to reproduce the exact bytes that were signed.
 
+### Receiver-side deduplication
+
+Every webhook delivery — both the initial dispatch and dead-letter replays —
+includes a `deliveryId` (UUID v4) in the signed payload body. Replays of the
+same logical delivery carry the identical `deliveryId`, while genuinely
+distinct events produce distinct IDs.
+
+To deduplicate on the receiver side:
+
+1. **Extract `deliveryId`** from the parsed JSON body.
+2. **Maintain an in-memory or persistent dedup cache** keyed on `deliveryId`.
+3. **On each delivery**, check whether the `deliveryId` already exists in the
+cache. If it does, acknowledge the webhook (return 200) but skip processing.
+4. **If the `deliveryId` is new**, process the event and add it to the cache.
+
+Example (Node.js):
+
+```js
+const deliveryCache = new Map(); // key: deliveryId, value: timestamp
+const DEDUP_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function isDuplicate(deliveryId) {
+  if (deliveryCache.has(deliveryId)) return true;
+  deliveryCache.set(deliveryId, Date.now());
+  return false;
+}
+
+// Periodically prune expired entries
+setInterval(() => {
+  const cutoff = Date.now() - DEDUP_TTL_MS;
+  for (const [id, ts] of deliveryCache) {
+    if (ts < cutoff) deliveryCache.delete(id);
+  }
+}, 60_000);
+```
+
+**Important:** Verify the HMAC signature before checking the dedup cache to
+ensure you are not accepting forged `deliveryId` values.
+
 ## Dead-letter queue
 
 If all retry attempts for a given subscriber are exhausted, the delivery is
 persisted to the `webhook_dead_letters` table (`db/013_webhook_dead_letters.sql`)
 instead of being dropped, with:
 
-- `payload` — the JSON body that was being delivered
+- `payload` — the JSON body that was being delivered (includes `deliveryId`)
+- `delivery_id` — the stable delivery identifier for deduplication
 - `url` — the target subscriber URL
 - `failure_reason` — the error message from the final failed attempt
 - `attempts` — number of attempts made
-- `status` — `'pending'` until successfully replayed, then `'replayed'`
+- `status` — `'pending'` until claimed for retry, `'in_progress'` while a
+  retry sweep is processing it, then `'replayed'` on success
+- `locked_by` — identifier of the worker processing the row (null when not claimed)
+- `locked_at` — timestamp when the row was claimed
+
+The retry job uses atomic claims (`UPDATE ... WHERE status = 'pending'`) to
+ensure that at most one concurrent sweep processes a given row, even if
+multiple sweeps overlap. The same `deliveryId` from the original delivery is
+preserved in the payload, so subscriber-side dedup works across replays.
 
 This never throws back into the caller that triggered the event — a broken or
 slow subscriber cannot fail an unrelated request (e.g. player registration).
+
+### Alerting and metrics (#1131)
+
+The dead-letter retry job refreshes a per-subscription Prometheus gauge and
+evaluates configurable thresholds on every sweep:
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `WEBHOOK_DLQ_SIZE_THRESHOLD` | `100` | Absolute queue depth |
+| `WEBHOOK_DLQ_RATE_THRESHOLD` | `50` | Inserts within the rate window |
+| `WEBHOOK_DLQ_RATE_WINDOW_MS` | `300000` | Sliding window for the rate check |
+| `PLATFORM_ADMIN_NOTIFY_URL` | _(empty)_ | Optional JSON POST target on crossing |
+
+Crossing either threshold emits a **critical** log line
+(`webhook_dead_letter_threshold_crossed`) that includes the top culprit
+subscriptions, and optionally notifies the platform-admin URL.
+
+Metrics (see `GET /metrics`):
+
+- `scout_off_webhook_dead_letters_total{subscription_id}` — gauge of current depth
+- `scout_off_webhook_dead_letters_inserted_total` — lifetime inserts
+- `scout_off_webhook_retry_success_total` — successful auto-retries
 
 ## Secret Rotation
 

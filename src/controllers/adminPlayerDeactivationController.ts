@@ -34,13 +34,13 @@ import { sanitizeInput } from '../utils/sanitizer';
 
 // ─── Schemas ──────────────────────────────────────────────────────────────────
 
-const deactivateBodySchema = z.object({
+export const deactivateBodySchema = z.object({
   reason: z
-    .string()
+    .string({ required_error: 'reason is required' })
     .min(1, 'reason is required')
     .max(500, 'reason must be 500 characters or fewer')
     .transform((s) => s.trim()),
-});
+}).strict();
 
 // ─── POST /api/admin/players/:playerId/deactivate ─────────────────────────────
 
@@ -49,124 +49,120 @@ export async function adminDeactivatePlayer(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
-  try {
-    // ── Validate playerId path param ─────────────────────────────────────────
-    const idResult = playerIdSchema.safeParse(req.params.playerId);
-    if (!idResult.success) {
-      res.status(400).json({
-        success: false,
-        error: idResult.error.errors[0]?.message ?? 'Invalid playerId',
-        code: ErrorCode.VALIDATION_ERROR,
-      });
-      return;
-    }
-    const playerId = sanitizeInput(req.params.playerId);
+  // ── Validate playerId path param ─────────────────────────────────────────
+  const idResult = playerIdSchema.safeParse(req.params.playerId as string);
+  if (!idResult.success) {
+    res.status(400).json({
+      success: false,
+      error: idResult.error.errors[0]?.message ?? 'Invalid playerId',
+      code: ErrorCode.VALIDATION_ERROR,
+    });
+    return;
+  }
+  const playerId = sanitizeInput(req.params.playerId as string);
 
-    // ── Validate body ────────────────────────────────────────────────────────
-    const bodyResult = deactivateBodySchema.safeParse(req.body);
-    if (!bodyResult.success) {
-      res.status(400).json({
-        success: false,
-        error: bodyResult.error.errors[0]?.message ?? 'reason is required',
-        code: ErrorCode.VALIDATION_ERROR,
-      });
-      return;
-    }
-    const { reason } = bodyResult.data;
+  // ── Validate body ────────────────────────────────────────────────────────
+  const bodyResult = deactivateBodySchema.safeParse(req.body);
+  if (!bodyResult.success) {
+    res.status(400).json({
+      success: false,
+      error: bodyResult.error.errors[0]?.message ?? 'reason is required',
+      code: ErrorCode.VALIDATION_ERROR,
+    });
+    return;
+  }
+  const { reason } = bodyResult.data;
 
-    // ── Fetch player ─────────────────────────────────────────────────────────
-    const player = getPlayerById(playerId);
-    if (!player) {
-      res.status(404).json({
-        success: false,
-        error: 'Player not found',
-        code: ErrorCode.PLAYER_NOT_FOUND,
-      });
-      return;
-    }
+  // ── Fetch player ─────────────────────────────────────────────────────────
+  const player = await getPlayerById(playerId);
+  if (!player) {
+    res.status(404).json({
+      success: false,
+      error: 'Player not found',
+      code: ErrorCode.PLAYER_NOT_FOUND,
+    });
+    return;
+  }
 
-    if (player.is_active === 0) {
-      res.status(409).json({
-        success: false,
-        error: 'Player is already deactivated',
-      });
-      return;
-    }
+  if (player.is_active === 0) {
+    res.status(409).json({
+      success: false,
+      error: 'Player is already deactivated',
+    });
+    return;
+  }
 
-    // ── Soft-delete ──────────────────────────────────────────────────────────
-    deactivatePlayerWithReason(playerId, reason);
+  // ── Soft-delete ──────────────────────────────────────────────────────────
+  await deactivatePlayerWithReason(playerId, reason);
 
-    // ── Cancel pending milestones ────────────────────────────────────────────
-    const cancelledCount = cancelPendingMilestonesForPlayer(playerId);
-    logger.info(
-      `[adminDeactivate] cancelled ${cancelledCount} pending milestone(s) for player=${playerId}`,
-    );
+  // ── Cancel pending milestones ────────────────────────────────────────────
+  const cancelledCount = await cancelPendingMilestonesForPlayer(playerId);
+  logger.info(
+    `[adminDeactivate] cancelled ${cancelledCount} pending milestone(s) for player=${playerId}`,
+  );
 
-    // ── Invalidate player cache ──────────────────────────────────────────────
-    await invalidatePlayerCache(playerId);
+  // ── Invalidate player cache ──────────────────────────────────────────────
+  await invalidatePlayerCache(playerId);
 
-    // ── SSE: notify connected scouts who unlocked this player ─────────────────
-    // Each unlock row carries the scout_wallet; we broadcast individually so
-    // the relevance filter in eventBroadcaster routes to the right subscriber.
-    const unlocks = getContactUnlocksByPlayer(playerId);
-    const notifiedScouts = new Set<string>();
+  // ── SSE: notify connected scouts who unlocked this player ─────────────────
+  // Each unlock row carries the scout_wallet; we broadcast individually so
+  // the relevance filter in eventBroadcaster routes to the right subscriber.
+  const unlocks = await getContactUnlocksByPlayer(playerId);
+  const notifiedScouts = new Set<string>();
 
-    for (const unlock of unlocks) {
-      broadcaster.broadcast({
-        type: 'player_deactivated',
-        payload: {
-          player_id: playerId,
-          wallet: player.wallet,
-          reason,
-          scout_wallet: unlock.scout_wallet,
-          deactivated_at: new Date().toISOString(),
-        },
-      });
-      notifiedScouts.add(unlock.scout_wallet);
-    }
-
-    // Also notify the player themselves.
+  for (const unlock of unlocks) {
     broadcaster.broadcast({
       type: 'player_deactivated',
       payload: {
         player_id: playerId,
         wallet: player.wallet,
         reason,
+        scout_wallet: unlock.scout_wallet,
         deactivated_at: new Date().toISOString(),
       },
     });
-
-    // ── Audit log ────────────────────────────────────────────────────────────
-    const adminWallet = req.account ?? 'unknown';
-    logAuditEvent({
-      action: 'player_deactivated',
-      adminWallet,
-      timestamp: new Date().toISOString(),
-      queryParams: {
-        player_id: playerId,
-        reason,
-        cancelled_milestones: cancelledCount,
-        notified_scouts: notifiedScouts.size,
-      },
-    });
-
-    logger.info(
-      `[adminDeactivate] player=${playerId} deactivated by admin=${adminWallet} ` +
-        `scouts_notified=${notifiedScouts.size}`,
-    );
-
-    res.json({
-      success: true,
-      message: 'Player deactivated successfully',
-      data: {
-        playerId,
-        cancelledMilestones: cancelledCount,
-        notifiedScouts: notifiedScouts.size,
-      },
-    });
-  } catch (err) {
-    next(err);
+    notifiedScouts.add(unlock.scout_wallet);
   }
+
+  // Also notify the player themselves.
+  broadcaster.broadcast({
+    type: 'player_deactivated',
+    payload: {
+      player_id: playerId,
+      wallet: player.wallet,
+      reason,
+      deactivated_at: new Date().toISOString(),
+    },
+  });
+
+  // ── Audit log ────────────────────────────────────────────────────────────
+  const adminWallet = req.account ?? 'unknown';
+  await logAuditEvent({
+    action: 'player_deactivated',
+    adminWallet,
+    timestamp: new Date().toISOString(),
+    queryParams: {
+      player_id: playerId,
+      reason,
+      cancelled_milestones: cancelledCount,
+      notified_scouts: notifiedScouts.size,
+    },
+  }).catch(() => {});
+
+  logger.info(
+    `[adminDeactivate] player=${playerId} deactivated by admin=${adminWallet} ` +
+      `scouts_notified=${notifiedScouts.size}`,
+  );
+
+  res.json({
+    success: true,
+    message: 'Player deactivated successfully',
+    data: {
+      playerId,
+      cancelledMilestones: cancelledCount,
+      notifiedScouts: notifiedScouts.size,
+    },
+  });
 }
 
 // ─── POST /api/admin/players/:playerId/reactivate ─────────────────────────────
@@ -176,73 +172,69 @@ export async function adminReactivatePlayer(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
-  try {
-    // ── Validate playerId ────────────────────────────────────────────────────
-    const idResult = playerIdSchema.safeParse(req.params.playerId);
-    if (!idResult.success) {
-      res.status(400).json({
-        success: false,
-        error: idResult.error.errors[0]?.message ?? 'Invalid playerId',
-        code: ErrorCode.VALIDATION_ERROR,
-      });
-      return;
-    }
-    const playerId = sanitizeInput(req.params.playerId);
-
-    // ── Fetch player ─────────────────────────────────────────────────────────
-    const player = getPlayerById(playerId);
-    if (!player) {
-      res.status(404).json({
-        success: false,
-        error: 'Player not found',
-        code: ErrorCode.PLAYER_NOT_FOUND,
-      });
-      return;
-    }
-
-    if (player.is_active === 1) {
-      res.status(409).json({
-        success: false,
-        error: 'Player is already active',
-      });
-      return;
-    }
-
-    // ── Reactivate ───────────────────────────────────────────────────────────
-    reactivatePlayerWithReason(playerId);
-
-    // ── Invalidate player cache ──────────────────────────────────────────────
-    await invalidatePlayerCache(playerId);
-
-    // ── SSE: notify the player ────────────────────────────────────────────────
-    broadcaster.broadcast({
-      type: 'player_reactivated',
-      payload: {
-        player_id: playerId,
-        wallet: player.wallet,
-        reactivated_at: new Date().toISOString(),
-      },
+  // ── Validate playerId ────────────────────────────────────────────────────
+  const idResult = playerIdSchema.safeParse(req.params.playerId as string);
+  if (!idResult.success) {
+    res.status(400).json({
+      success: false,
+      error: idResult.error.errors[0]?.message ?? 'Invalid playerId',
+      code: ErrorCode.VALIDATION_ERROR,
     });
-
-    // ── Audit log ────────────────────────────────────────────────────────────
-    const adminWallet = req.account ?? 'unknown';
-    logAuditEvent({
-      action: 'player_reactivated',
-      adminWallet,
-      timestamp: new Date().toISOString(),
-      queryParams: { player_id: playerId },
-    });
-
-    logger.info(
-      `[adminReactivate] player=${playerId} reactivated by admin=${adminWallet}`,
-    );
-
-    res.json({
-      success: true,
-      message: 'Player reactivated successfully',
-      data: { playerId },
-    });
-  } catch (err) {
-    next(err);
+    return;
   }
+  const playerId = sanitizeInput(req.params.playerId as string);
+
+  // ── Fetch player ─────────────────────────────────────────────────────────
+  const player = await getPlayerById(playerId);
+  if (!player) {
+    res.status(404).json({
+      success: false,
+      error: 'Player not found',
+      code: ErrorCode.PLAYER_NOT_FOUND,
+    });
+    return;
+  }
+
+  if (player.is_active === 1) {
+    res.status(409).json({
+      success: false,
+      error: 'Player is already active',
+    });
+    return;
+  }
+
+  // ── Reactivate ───────────────────────────────────────────────────────────
+  await reactivatePlayerWithReason(playerId);
+
+  // ── Invalidate player cache ──────────────────────────────────────────────
+  await invalidatePlayerCache(playerId);
+
+  // ── SSE: notify the player ────────────────────────────────────────────────
+  broadcaster.broadcast({
+    type: 'player_reactivated',
+    payload: {
+      player_id: playerId,
+      wallet: player.wallet,
+      reactivated_at: new Date().toISOString(),
+    },
+  });
+
+  // ── Audit log ────────────────────────────────────────────────────────────
+  const adminWallet = req.account ?? 'unknown';
+  await logAuditEvent({
+    action: 'player_reactivated',
+    adminWallet,
+    timestamp: new Date().toISOString(),
+    queryParams: { player_id: playerId },
+  }).catch(() => {});
+
+  logger.info(
+    `[adminReactivate] player=${playerId} reactivated by admin=${adminWallet}`,
+  );
+
+  res.json({
+    success: true,
+    message: 'Player reactivated successfully',
+    data: { playerId },
+  });
 }

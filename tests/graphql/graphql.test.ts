@@ -25,7 +25,7 @@ jest.mock('../../src/services/stellar', () => ({
 }));
 
 jest.mock('../../src/services/tokenBlocklist', () => ({
-  isTokenRevoked: jest.fn().mockReturnValue(false),
+  isTokenRevoked: jest.fn().mockResolvedValue(false),
 }));
 
 // ─── Imports ──────────────────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ import { useValidationRule } from '@envelop/core';
 import request from 'supertest';
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import { GraphQLError, ValidationContext, ASTNode, Kind } from 'graphql';
+import { GraphQLError, Kind } from 'graphql';
 import {
   getPlayerById,
   queryPlayers,
@@ -47,6 +47,13 @@ import { queryMilestones } from '../../src/services/stellar';
 import { typeDefs } from '../../src/graphql/schema';
 import { resolvers } from '../../src/graphql/resolvers';
 import { createContext } from '../../src/graphql/context';
+// Shared validation rules — single source of truth with src/graphql/index.ts.
+import {
+  createDepthLimitRule,
+  createQueryCostRule,
+  MAX_DEPTH,
+  MAX_QUERY_COST,
+} from '../../src/graphql/validation';
 
 // ─── Production introspection-blocking plugin (mirrors src/graphql/index.ts) ─
 
@@ -75,63 +82,6 @@ function createBlockIntrospectionPlugin() {
         }
       }
     },
-  };
-}
-
-function createDepthLimitRule(maxDepth: number) {
-  return function depthLimitRule(context: ValidationContext) {
-    return {
-      OperationDefinition(operation: ASTNode) {
-        if (operation.kind !== Kind.OPERATION_DEFINITION) return;
-
-        const fragments = context.getDocument().definitions
-          .filter(
-            (d): d is import('graphql').FragmentDefinitionNode =>
-              d.kind === Kind.FRAGMENT_DEFINITION,
-          )
-          .reduce<Record<string, import('graphql').FragmentDefinitionNode>>(
-            (acc, frag) => { acc[frag.name.value] = frag; return acc; },
-            {},
-          );
-
-        function measureDepth(
-          node: import('graphql').SelectionSetNode | undefined,
-          depth: number,
-          visited: Set<string>,
-        ): number {
-          if (!node) return depth;
-          let max = depth;
-          for (const selection of node.selections) {
-            if (selection.kind === Kind.FIELD) {
-              if (selection.name.value.startsWith('__')) continue;
-              const child = measureDepth(selection.selectionSet, depth + 1, visited);
-              if (child > max) max = child;
-            } else if (selection.kind === Kind.INLINE_FRAGMENT) {
-              const child = measureDepth(selection.selectionSet, depth, visited);
-              if (child > max) max = child;
-            } else if (selection.kind === Kind.FRAGMENT_SPREAD) {
-              const name = selection.name.value;
-              if (!visited.has(name) && fragments[name]) {
-                visited.add(name);
-                const child = measureDepth(fragments[name].selectionSet, depth, visited);
-                if (child > max) max = child;
-              }
-            }
-          }
-          return max;
-        }
-
-        const depth = measureDepth(operation.selectionSet, 0, new Set());
-        if (depth > maxDepth) {
-          context.reportError(
-            new GraphQLError(
-              `Query depth ${depth} exceeds maximum allowed depth of ${maxDepth}.`,
-              { nodes: [operation] },
-            ),
-          );
-        }
-      },
-    };
   };
 }
 
@@ -197,7 +147,8 @@ function buildApp(opts: { production?: boolean } = {}) {
     schema: createSchema({ typeDefs, resolvers }),
     context: createContext,
     plugins: [
-      useValidationRule(createDepthLimitRule(5)),
+      useValidationRule(createDepthLimitRule(MAX_DEPTH)),
+      useValidationRule(createQueryCostRule(MAX_QUERY_COST)),
       ...(isProduction ? [createBlockIntrospectionPlugin()] : []),
     ],
     graphqlEndpoint: '/graphql',

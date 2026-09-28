@@ -19,18 +19,35 @@ jest.mock('../../src/db', () => ({
   queryEvents: jest.fn().mockReturnValue([]),
   queryPlayers: jest.fn().mockReturnValue([]),
   countPlayers: jest.fn().mockReturnValue(0),
-  getPlayerById: jest.fn().mockReturnValue(null),
+  searchPlayers: jest.fn().mockReturnValue({ data: [], nextCursor: null }),
+  countEventsFiltered: jest.fn().mockReturnValue(0),
+  getEventsPage: jest.fn().mockReturnValue([]),
+  getSavedSearchesByScout: jest.fn().mockReturnValue([]),
+  getBookmarksByScout: jest.fn().mockReturnValue([]),
+  getPlayerById: jest.fn().mockReturnValue({
+    player_id: 'b8e1a1d3',
+    wallet: 'GDUP7WH3BJ3S3RGDQO5T2D3B4QN6P2ZJ3F5D6K7L8M9N0P1Q2R3S4T5U6V',
+    position: 'Forward',
+    region: 'West Africa',
+    metadata_uri: null,
+    progress_level: 1,
+    created_at: 1700000000,
+    registered_at: 1700000000,
+    is_active: 1,
+  }),
   getEventsCount: jest.fn().mockReturnValue(0),
   fetchLastIndexedLedger: jest.fn().mockReturnValue(0),
   persistLastIndexedLedger: jest.fn(),
   insertPlayerProfileHistory: jest.fn(),
   getPlayerProfileHistory: jest.fn().mockReturnValue([]),
+  countTrialOffersByPlayer: jest.fn().mockReturnValue(0),
   insertOrUpdatePlayer: jest.fn(),
   getPendingMilestones: jest.fn().mockReturnValue({ data: [], total: 0 }),
   getContactUnlocksByScout: jest.fn().mockReturnValue([]),
   hasContactUnlock: jest.fn().mockReturnValue(true),
   insertContactUnlock: jest.fn(),
   getLatestSubscription: jest.fn().mockReturnValue(null),
+  getSubscriptionsByScout: jest.fn().mockReturnValue([]),
   insertSubscription: jest.fn(),
   dbRenewSubscription: jest.fn(),
   dbCancelSubscription: jest.fn(),
@@ -45,6 +62,24 @@ jest.mock('../../src/db', () => ({
   insertAdminActionSignature: jest.fn(),
   getAdminActionSignature: jest.fn().mockReturnValue(null),
   getAdminActionSignatures: jest.fn().mockReturnValue([]),
+  // src/utils/audit.ts's recordAudit (used by filterPlayers, milestone
+  // submission/listing) calls this directly — not mocked via
+  // services/audit's logAuditEvent below.
+  insertAuditLog: jest.fn().mockResolvedValue({
+    id: 1,
+    action: 'player_search',
+    admin_wallet: '',
+    query_params: '{}',
+    created_at: new Date().toISOString(),
+    prev_hash: '0'.repeat(64),
+    hash: 'mock-hash-1',
+    event_source: 'app_event',
+  }),
+  // src/app.ts's /health and /ready probes go through getDriver().
+  getDriver: jest.fn().mockReturnValue({
+    get: jest.fn().mockResolvedValue({ '?column?': 1 }),
+    run: jest.fn().mockResolvedValue({ changes: 1, lastId: 0 }),
+  }),
 }));
 
 jest.mock('../../src/services/indexer', () => ({
@@ -68,6 +103,8 @@ jest.mock('../../src/services/webhooks', () => ({
 }));
 
 jest.mock('../../src/services/cache', () => ({
+  getPlayerListLastModified: jest.fn(() => 0),
+  __setPlayerListLastModifiedForTests: jest.fn(),
   invalidatePlayerCache: jest.fn(),
   invalidateMilestoneCache: jest.fn(),
   cacheGet: jest.fn().mockReturnValue(undefined),
@@ -120,7 +157,7 @@ jest.mock('../../src/services/stellar', () => ({
 }));
 
 jest.mock('../../src/services/audit', () => ({
-  logAuditEvent: jest.fn(),
+  logAuditEvent: jest.fn().mockResolvedValue(undefined),
 }));
 
 // ─── Shape helpers ────────────────────────────────────────────────────────────
@@ -180,7 +217,7 @@ describe('POST /auth/token — envelope shape', () => {
     const challengeRes = await request(app).get(`/auth/challenge?account=${kp.publicKey()}`);
     const tx = new Transaction(challengeRes.body.challenge, Networks.TESTNET);
     tx.sign(kp);
-    const res = await request(app).post('/auth/token').send({ transaction: tx.toXDR() });
+    const res = await request(app).post('/auth/token').send({ transaction: tx.toXdr() });
     expect(res.status).toBe(200);
     expect(typeof res.body.token).toBe('string');
     expect(typeof res.body.account).toBe('string');
@@ -223,6 +260,9 @@ describe('GET /api/players — envelope shape', () => {
 
 describe('GET /api/players/:playerId — envelope shape', () => {
   it('error: { success: false, error: string } for non-existent player', async () => {
+    // The default mock returns a player row (needed by the unlock envelope
+    // test above); this route test requires a missing player.
+    (require('../../src/db').getPlayerById as jest.Mock).mockReturnValueOnce(null);
     const res = await request(app).get(`/api/players/${PLAYER_WALLET}`);
     expect(res.status).toBe(404);
     assertErrorEnvelope(res.body);
@@ -255,9 +295,15 @@ describe('POST /api/players/register — envelope shape', () => {
 
 describe('PUT /api/players/:playerId — envelope shape', () => {
   it('success: { success: true, data: object }', async () => {
+    // PUT requires the current ETag echoed as If-Match (#1151) — fetch it
+    // via GET first, the way a real client would.
+    const getRes = await request(app).get(`/api/players/${PLAYER_WALLET}`);
+    expect(getRes.status).toBe(200);
+
     const res = await request(app)
       .put(`/api/players/${PLAYER_WALLET}`)
       .set('Authorization', `Bearer ${playerToken}`)
+      .set('If-Match', getRes.headers.etag)
       .send({ metadataUri: 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG' });
     expect(res.status).toBe(200);
     assertSuccessEnvelope(res.body);
@@ -306,7 +352,7 @@ describe('POST /api/validators/milestone — envelope shape', () => {
     const res = await request(app)
       .post('/api/validators/milestone')
       .set('Authorization', `Bearer ${validatorToken}`)
-      .send({ playerId: 'player-1', milestoneType: 'identity', evidenceUri: 'ipfs://QmTest' });
+      .send({ playerId: 'player-1', milestoneType: 'identity', evidenceUri: 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG' });
     expect(res.status).toBe(201);
     assertSuccessEnvelope(res.body);
   });
@@ -699,9 +745,14 @@ describe('POST /api/admin/indexer/reindex — envelope shape', () => {
 // ─── Error shape — 404 for unknown routes ─────────────────────────────────────
 
 describe('404 for unknown routes — envelope shape', () => {
-  it('error: { success: false, error: string } for unknown path', async () => {
+  // The catch-all 404 handler intentionally departs from the
+  // { success: false, error } envelope used elsewhere: #861 changed it to
+  // { error, path } so API clients can see which route was unmatched
+  // without parsing an HTML error page. See src/app.ts's final app.use().
+  it('error: { error: string, path: string } for unknown path', async () => {
     const res = await request(app).get('/api/does-not-exist');
     expect(res.status).toBe(404);
-    assertErrorEnvelope(res.body);
+    expect(res.body).toHaveProperty('error', 'Not Found');
+    expect(res.body).toHaveProperty('path', '/api/does-not-exist');
   });
 });

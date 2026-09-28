@@ -13,6 +13,8 @@ function makeToken(sub: string, role = 'scout'): string {
 jest.mock('../../src/db', () => ({
   queryEvents: jest.fn(),
   getPlayerById: jest.fn(),
+  getContactUnlocksByScout: jest.fn().mockReturnValue([]),
+  getSubscriptionsByScout: jest.fn().mockReturnValue([]),
 }));
 
 jest.mock('../../src/services/indexer', () => ({

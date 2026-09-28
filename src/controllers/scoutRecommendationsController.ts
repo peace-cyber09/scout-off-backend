@@ -37,8 +37,7 @@ import {
   type SavedSearchRow,
 } from '../db';
 import { cacheGet, cacheSet } from '../services/cache';
-import { isValidStellarAddress } from '../utils/stellarAddress';
-import { sendForbidden } from '../utils/authError';
+import { checkWalletOwnership } from '../middleware/requireOwner';
 import { getTierMeta, tierName } from '../utils/tier';
 import { logger } from '../utils/logger';
 import { queryEvents } from '../db';
@@ -250,13 +249,14 @@ function getRecentlyApprovedPlayerIds(): Set<string> {
  * players table is small in typical deployments; at scale, the 10-min cache
  * means this path runs at most once per scout every 10 minutes.
  */
-function fetchCandidatePool(prefs: ScoutPreferences): PlayerRow[] {
+async function fetchCandidatePool(prefs: ScoutPreferences): Promise<PlayerRow[]> {
   if (!prefs.hasHistory) {
     // Fallback: top 20 by tier (highest first), then by recency
-    return queryPlayers({
+    const rows = await queryPlayers({
       limit: PAGE_SIZE,
       offset: 0,
-    }).sort(
+    });
+    return rows.sort(
       (a, b) =>
         b.progress_level - a.progress_level ||
         (b.created_at ?? 0) - (a.created_at ?? 0),
@@ -292,19 +292,22 @@ function serializePlayer(row: PlayerRow): RecommendedPlayer {
  * Builds the full sorted recommendation list for a scout.  This function is
  * called once and its result cached for CACHE_TTL_MS milliseconds.
  */
-function buildRecommendations(wallet: string): {
+async function buildRecommendations(wallet: string): Promise<{
   ranked: ScoredPlayer[];
   prefs: ScoutPreferences;
-} {
+}> {
   // ── 1. Gather input signals ───────────────────────────────────────────────
-  const savedSearches = getSavedSearchesByScout(wallet);
-  const bookmarkRows = getBookmarksByScout(wallet);
-  const contactUnlocks = getContactUnlocksByScout(wallet);
+  const savedSearches = await getSavedSearchesByScout(wallet);
+  const bookmarkRows = await getBookmarksByScout(wallet);
+  const contactUnlocks = await getContactUnlocksByScout(wallet);
 
   // Enrich bookmarks with full player rows for region/position extraction
-  const bookmarkedPlayers: PlayerRow[] = bookmarkRows
-    .map((b) => getPlayerById(b.player_id))
-    .filter((p): p is PlayerRow => p !== null);
+  const bookmarkedPlayersRaw = await Promise.all(
+    bookmarkRows.map((b) => getPlayerById(b.player_id)),
+  );
+  const bookmarkedPlayers: PlayerRow[] = bookmarkedPlayersRaw.filter(
+    (p): p is PlayerRow => p !== null,
+  );
 
   const contactedIds = new Set<string>(contactUnlocks.map((u) => u.player_id));
 
@@ -315,7 +318,7 @@ function buildRecommendations(wallet: string): {
   const recentlyApproved = getRecentlyApprovedPlayerIds();
 
   // ── 4. Fetch candidate pool ───────────────────────────────────────────────
-  const candidates = fetchCandidatePool(prefs);
+  const candidates = await fetchCandidatePool(prefs);
 
   // ── 5. Filter, score, and sort ────────────────────────────────────────────
   const ranked: ScoredPlayer[] = candidates
@@ -377,33 +380,29 @@ export async function getScoutRecommendations(
   res: Response,
   next: NextFunction,
 ): Promise<void> {
+  const {wallet} = req.params as {wallet: string};
+
+  // ── Ownership guard ──────────────────────────────────────────────────────
+  // Enforced by requireWalletOwner() at the route level; re-invoked here so
+  // direct callers (unit tests) get the same protection from the shared
+  // implementation instead of an inline copy.
+  if (!checkWalletOwnership(req, res)) return;
+
+  // ── Query param validation ───────────────────────────────────────────────
+  const parsed = recQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      error: parsed.error.errors[0]?.message ?? 'Invalid query parameters',
+    });
+    return;
+  }
+
+  const { cursor, pageSize: pageSizeParam } = parsed.data;
+  const pageSize = pageSizeParam ?? PAGE_SIZE;
+
   try {
-    const { wallet } = req.params;
-
-    // ── Ownership guard ──────────────────────────────────────────────────────
-    if (!isValidStellarAddress(wallet)) {
-      res.status(400).json({ success: false, error: 'Invalid Stellar address' });
-      return;
-    }
-    if (req.account !== wallet) {
-      sendForbidden(res, 'Forbidden: wallet mismatch');
-      return;
-    }
-
-    // ── Query param validation ───────────────────────────────────────────────
-    const parsed = recQuerySchema.safeParse(req.query);
-    if (!parsed.success) {
-      res.status(400).json({
-        success: false,
-        error: parsed.error.errors[0]?.message ?? 'Invalid query parameters',
-      });
-      return;
-    }
-
-    const { cursor, pageSize: pageSizeParam } = parsed.data;
-    const pageSize = pageSizeParam ?? PAGE_SIZE;
-
-    // ── Cache check ──────────────────────────────────────────────────────────
+    // ── Cache check ────────────────────────────────────────────────────────
     // We cache the full ranked list, not a single page, so pagination works
     // across cache hits without re-querying the DB.
     const cacheKey = `recommendations:${wallet}`;
@@ -411,7 +410,7 @@ export async function getScoutRecommendations(
 
     if (!cachedResult) {
       logger.debug({ wallet, action: 'recommendations_cache_miss' });
-      cachedResult = buildRecommendations(wallet);
+      cachedResult = await buildRecommendations(wallet);
       await cacheSet(cacheKey, cachedResult, CACHE_TTL_MS);
     } else {
       logger.debug({ wallet, action: 'recommendations_cache_hit' });
@@ -419,7 +418,7 @@ export async function getScoutRecommendations(
 
     const { ranked, prefs } = cachedResult;
 
-    // ── Apply pagination ─────────────────────────────────────────────────────
+    // ── Apply pagination ──────────────────────────────────────────────────
     const { page, nextCursor } = applyPagination(ranked, cursor, pageSize);
 
     const response: RecommendationsPage = {

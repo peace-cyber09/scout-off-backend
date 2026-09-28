@@ -66,6 +66,22 @@ export function runCacheStoreContractTests(
       await expect(store.has('short-lived')).resolves.toBe(false);
     }, 10000);
 
+    /**
+     * ttlMs=0 contract (#673): both implementations must treat a zero TTL as
+     * "expire immediately". The entry must never be readable after set() returns —
+     * neither get() nor has() should see it.
+     *
+     * InMemoryCacheStore: expiresAt = Date.now() + 0, so the entry is instantly
+     * past its deadline and filtered on the very next read.
+     * RedisCacheStore: a PX 0 write is skipped entirely (Redis rejects it), which
+     * produces the same observable result — the key is never visible.
+     */
+    it('ttlMs=0 — entry is never readable (identical behavior across backends)', async () => {
+      await store.set('zero-ttl', 'should-never-be-seen', 0);
+      await expect(store.get('zero-ttl')).resolves.toBeUndefined();
+      await expect(store.has('zero-ttl')).resolves.toBe(false);
+    });
+
     it('keeps a value without a TTL beyond a short window', async () => {
       await store.set('persistent', 'value');
       await sleep(100);

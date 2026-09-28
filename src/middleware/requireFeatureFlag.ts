@@ -7,8 +7,8 @@ import { ErrorCode } from '../utils/errorCodes';
  * Changes take effect immediately via the in-process feature-flag cache.
  */
 export function requireFeatureFlag(flagName: string) {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    if (isFeatureEnabled(flagName, { account: req.account })) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    if (await isFeatureEnabled(flagName, { account: req.account })) {
       next();
       return;
     }

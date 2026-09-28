@@ -27,10 +27,13 @@ The backend issues JSON Web Tokens (JWTs) to authenticate players, scouts, valid
 
 ### Rotation Procedure
 
-To rotate the JWT secret without disrupting active users, follow the instructions documented in the auth section of the environment configuration:
+To rotate the JWT secret without disrupting active users:
 
 1. **Staging the Transition**:
    - Copy the current value of `JWT_SECRET` into `JWT_SECRET_PREVIOUS`.
+   - Set `JWT_SECRET_PREVIOUS_UNTIL` to an absolute deadline covering the
+     maximum token lifetime (**7 days** for refresh tokens — not 24 hours).
+     Accepts Unix seconds or an ISO-8601 datetime.
    - Generate a new cryptographically secure secret (minimum 32 characters).
      ```bash
      openssl rand -hex 32
@@ -38,12 +41,20 @@ To rotate the JWT secret without disrupting active users, follow the instruction
    - Update `JWT_SECRET` to the new generated value.
 2. **First Deployment**:
    - Deploy the new configuration and perform a rolling update of the service.
-   - The server will sign all new JWTs with the new `JWT_SECRET`, but will continue to accept active tokens signed with the old secret (via `JWT_SECRET_PREVIOUS`).
+   - The server signs all **new** JWTs with `JWT_SECRET`, but continues to
+     accept tokens signed with `JWT_SECRET_PREVIOUS` until
+     `JWT_SECRET_PREVIOUS_UNTIL`.
 3. **Transition Window**:
-   - Leave both secrets active for a transition period equal to the maximum token lifetime (e.g., 24 hours).
+   - Leave both secrets active until the grace deadline (or until all old
+     sessions expire — whichever you choose operationally).
 4. **Final Deprecation**:
-   - Once all old sessions have expired, clear `JWT_SECRET_PREVIOUS` from the environment.
-   - Perform a final rolling update of the service. Tokens signed with the old secret will now be rejected.
+   - Once the window ends, clear `JWT_SECRET_PREVIOUS` and
+     `JWT_SECRET_PREVIOUS_UNTIL` from the environment.
+   - Perform a final rolling update. Tokens signed with the old secret are
+     rejected. Use the token blocklist to revoke a specific compromised token
+     immediately without rotating the secret.
+
+See also the Kubernetes runbook in [DEPLOYMENT.md](../DEPLOYMENT.md#jwt-secret-rotation-runbook-zero-downtime-dual-key).
 
 ---
 

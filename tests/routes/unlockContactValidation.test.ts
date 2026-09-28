@@ -29,6 +29,17 @@ const mockInsertContactUnlock = jest.fn();
 const mockSubmitContactPayment = jest.fn();
 const mockGetPlayerById = jest.fn();
 
+// ── Idempotency store (mirrors the real SQLite INSERT OR IGNORE semantics) ──
+interface StoredIdempotencyRecord {
+  status_code: number;
+  response: string;
+  status: 'pending' | 'complete';
+  expires_at: number;
+  request_fingerprint: string | null;
+}
+
+const idempotencyStore = new Map<string, StoredIdempotencyRecord>();
+
 jest.mock('../../src/db', () => ({
   queryEvents: jest.fn().mockReturnValue([]),
   getPlayerById: (...args: unknown[]) => mockGetPlayerById(...args),
@@ -41,6 +52,44 @@ jest.mock('../../src/db', () => ({
   insertContactUnlock: (...args: unknown[]) => mockInsertContactUnlock(...args),
   hasContactUnlock: (...args: unknown[]) => mockHasContactUnlock(...args),
   getContactUnlocksByScout: jest.fn().mockReturnValue([]),
+
+  getIdempotencyRecord: jest.fn((key: string) => {
+    const record = idempotencyStore.get(key);
+    if (!record) return null;
+    if (record.expires_at <= Date.now()) return null;
+    return { key, ...record };
+  }),
+
+  claimIdempotencyKey: jest.fn((key: string, requestFingerprint: string | null) => {
+    if (idempotencyStore.has(key)) return false;
+    idempotencyStore.set(key, {
+      status_code: 0,
+      response: '',
+      status: 'pending',
+      expires_at: Date.now() + 24 * 60 * 60 * 1000,
+      request_fingerprint: requestFingerprint ?? null,
+    });
+    return true;
+  }),
+
+  updateIdempotencyRecord: jest.fn((key: string, statusCode: number, body: unknown) => {
+    const record = idempotencyStore.get(key);
+    if (record) {
+      record.status_code = statusCode;
+      record.response = JSON.stringify(body);
+      record.status = 'complete';
+    }
+  }),
+
+  saveIdempotencyRecord: jest.fn((key: string, statusCode: number, body: unknown) => {
+    idempotencyStore.set(key, {
+      status_code: statusCode,
+      response: JSON.stringify(body),
+      status: 'complete',
+      expires_at: Date.now() + 24 * 60 * 60 * 1000,
+      request_fingerprint: null,
+    });
+  }),
 }));
 
 jest.mock('../../src/services/indexer', () => ({
@@ -73,6 +122,7 @@ function makeToken(wallet: string, role: string) {
 
 describe('#303 POST /api/scouts/:wallet/contacts/:playerId/unlock — body validation', () => {
   beforeEach(() => {
+    idempotencyStore.clear();
     mockHasContactUnlock.mockReturnValue(false);
     mockInsertContactUnlock.mockReset();
     mockSubmitContactPayment.mockReset();
@@ -118,6 +168,7 @@ describe('#826 POST /api/scouts/:wallet/contacts/:playerId/unlock — duplicate 
   };
 
   beforeEach(() => {
+    idempotencyStore.clear();
     mockHasContactUnlock.mockReset();
     mockInsertContactUnlock.mockReset();
     mockSubmitContactPayment.mockReset();
@@ -175,8 +226,7 @@ describe('#826 POST /api/scouts/:wallet/contacts/:playerId/unlock — duplicate 
     expect(res.body.data.alreadyUnlocked).toBe(true);
     expect(res.body.data.playerId).toBe(PLAYER_ID);
     expect(res.body.data.wallet).toBe(PLAYER_ROW.wallet);
-    expect(res.body.data.email).toBeDefined();
-    expect(res.body.data.phone).toBeDefined();
+    expect(res.body.data.metadataUri).toBe(PLAYER_ROW.metadata_uri);
   });
 
   it('race condition: ON CONFLICT ensures exactly one DB row when two requests arrive simultaneously', async () => {
@@ -218,5 +268,108 @@ describe('#826 POST /api/scouts/:wallet/contacts/:playerId/unlock — duplicate 
     // called at most twice (once per request), and the UNIQUE constraint is
     // the hard guarantee (tested via insertContactUnlock's real SQL in db tests).
     expect(insertCount).toBeLessThanOrEqual(2);
+  });
+});
+
+// ─── #761 — Idempotency-Key replay & fingerprint conflict ─────────────────────
+
+describe('#761 POST /api/scouts/:wallet/contacts/:playerId/unlock — idempotency', () => {
+  const PLAYER_A = PLAYER_ID;
+  const PLAYER_B = 'player-unlock-303-b';
+  const PLAYER_ROW = {
+    player_id: PLAYER_A,
+    wallet: 'GPLAYER_WALLET_ADDRESS',
+    position: 'Forward',
+    region: 'West Africa',
+    metadata_uri: null,
+    progress_level: 2,
+    created_at: 1700000000,
+    is_active: 1,
+  };
+
+  beforeEach(() => {
+    idempotencyStore.clear();
+    mockHasContactUnlock.mockReset().mockReturnValue(false);
+    mockInsertContactUnlock.mockReset();
+    mockSubmitContactPayment.mockReset();
+    mockGetPlayerById.mockReset().mockReturnValue(PLAYER_ROW);
+    mockSubmitContactPayment.mockResolvedValue({ transactionId: 'stub-tx-idem', status: 'submitted' });
+  });
+
+  it('replays the same idempotency key from the cache without submitting a second transaction', async () => {
+    const token = makeToken(WALLET, 'scout');
+
+    const first = await request(app)
+      .post(`/api/scouts/${WALLET}/contacts/${PLAYER_A}/unlock`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'idem-key-001')
+      .send({});
+
+    expect(first.status).toBe(200);
+    expect(mockSubmitContactPayment).toHaveBeenCalledTimes(1);
+    expect(mockInsertContactUnlock).toHaveBeenCalledTimes(1);
+
+    const replay = await request(app)
+      .post(`/api/scouts/${WALLET}/contacts/${PLAYER_A}/unlock`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'idem-key-001')
+      .send({});
+
+    expect(replay.status).toBe(200);
+    // The cached response body is served verbatim.
+    expect(replay.body).toEqual(first.body);
+    expect(replay.body.success).toBe(true);
+    // No second blockchain transaction and no second DB insert.
+    expect(mockSubmitContactPayment).toHaveBeenCalledTimes(1);
+    expect(mockInsertContactUnlock).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects the same idempotency key used with a materially different request (409)', async () => {
+    const token = makeToken(WALLET, 'scout');
+
+    const first = await request(app)
+      .post(`/api/scouts/${WALLET}/contacts/${PLAYER_A}/unlock`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'idem-key-conflict')
+      .send({});
+
+    expect(first.status).toBe(200);
+    expect(mockSubmitContactPayment).toHaveBeenCalledTimes(1);
+
+    // Same key, different playerId → fingerprint conflict → 409, no payment.
+    const conflict = await request(app)
+      .post(`/api/scouts/${WALLET}/contacts/${PLAYER_B}/unlock`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'idem-key-conflict')
+      .send({});
+
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.error).toMatch(/different request/i);
+    expect(mockSubmitContactPayment).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns the cached result for a replay even after the handler would have failed a second time', async () => {
+    // First request succeeds and caches the response.
+    const token = makeToken(WALLET, 'scout');
+    const first = await request(app)
+      .post(`/api/scouts/${WALLET}/contacts/${PLAYER_A}/unlock`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'idem-key-cached')
+      .send({});
+    expect(first.status).toBe(200);
+    expect(mockSubmitContactPayment).toHaveBeenCalledTimes(1);
+
+    // Now a replay arrives while the underlying service is down — the cached
+    // response must still be served and no new transaction attempted.
+    mockSubmitContactPayment.mockRejectedValue(new Error('RPC down'));
+    const replay = await request(app)
+      .post(`/api/scouts/${WALLET}/contacts/${PLAYER_A}/unlock`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'idem-key-cached')
+      .send({});
+
+    expect(replay.status).toBe(200);
+    expect(replay.body).toEqual(first.body);
+    expect(mockSubmitContactPayment).toHaveBeenCalledTimes(1);
   });
 });

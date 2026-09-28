@@ -48,6 +48,9 @@ function loadSpec(): Record<string, unknown> {
 /**
  * GET /api/docs
  * Returns the OpenAPI 3.0 specification as JSON.
+ *
+ * @response 200 OpenAPI 3.0 document (application/json)
+ * @response 500 { success: false, error: string } - Spec file missing or unparsable
  */
 router.get('/', (_req: Request, res: Response) => {
   try {
@@ -61,6 +64,9 @@ router.get('/', (_req: Request, res: Response) => {
 /**
  * GET /api/docs/yaml
  * Returns the raw OpenAPI YAML source.
+ *
+ * @response 200 Raw OpenAPI YAML (text/yaml)
+ * @response 500 { success: false, error: string } - Spec file missing
  */
 router.get('/yaml', (_req: Request, res: Response) => {
   try {
@@ -76,6 +82,9 @@ router.get('/yaml', (_req: Request, res: Response) => {
  * Serves embedded Swagger UI.
  * Requires `swagger-ui-dist` to be installed:
  *   npm install swagger-ui-dist
+ *
+ * @response 200 Swagger UI HTML page (text/html)
+ * @response 501 { success: false, error: string } - swagger-ui-dist not installed
  */
 router.get('/ui', (_req: Request, res: Response) => {
   try {
